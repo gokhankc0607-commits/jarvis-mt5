@@ -1,0 +1,47 @@
+# GitHub Actions — JARVIS.exe'yi Windows sunucusunda otomatik derler.
+# Kullanım: JARVIS-Agent klasörünü (zip içeriği) yeni bir GitHub reposunun köküne koyup push edin.
+# .github/workflows/build-agent.yml zaten yerindedir. Actions > "Build JARVIS EXE" > Run workflow.
+# DİKKAT: config.json ajan anahtarınızı içerir — reponuzu PRIVATE yapın veya config.json'u silin.
+# Actions sekmesinden "JARVIS-Windows" artefaktını (EXE + Setup) indirin.
+name: Build JARVIS EXE
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Bağımlılıklar
+        run: |
+          python -m pip install --upgrade pip wheel
+          pip install -r requirements.txt -r requirements-voice.txt "pyinstaller>=6.10,<7"
+      - name: PyInstaller
+        run: pyinstaller --noconfirm --clean jarvis.spec
+      - name: Ses ve Whisper modelleri
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/JARVIS/voices, dist/JARVIS/models | Out-Null
+          $pv = "https://huggingface.co/rhasspy/piper-voices/resolve/main/tr/tr_TR/dfki/medium"
+          Invoke-WebRequest "$pv/tr_TR-dfki-medium.onnx" -OutFile dist/JARVIS/voices/tr_TR-dfki-medium.onnx
+          Invoke-WebRequest "$pv/tr_TR-dfki-medium.onnx.json" -OutFile dist/JARVIS/voices/tr_TR-dfki-medium.onnx.json
+          python -c "from faster_whisper import download_model; download_model('small', output_dir='dist/JARVIS/models/whisper-small')"
+          Copy-Item config.example.json, README.md dist/JARVIS/
+          if (Test-Path config.json) { Copy-Item config.json dist/JARVIS/ }
+      - name: Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) { choco install innosetup -y --no-progress }
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /Q installer.iss
+      - uses: actions/upload-artifact@v4
+        with:
+          name: JARVIS-Windows
+          path: |
+            dist/JARVIS-Setup.exe
+            dist/JARVIS/
