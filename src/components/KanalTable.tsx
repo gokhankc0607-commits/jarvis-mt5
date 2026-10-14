@@ -5,7 +5,7 @@ import { RsiGauge, SymbolIcon } from "./hud";
 import { categoryOf } from "@/lib/tf";
 import type { KanalItem } from "@/lib/kanal";
 
-const STAGE_TXT = ["Beklemede", "Band kırıldı", "Band içine döndü", "3/4 koşul", "4/4 · SİNYAL"];
+const STAGE_TXT = ["Beklemede", "Band kırıldı", "Band içine döndü", "3/5 koşul", "4/5 · yön onayı bekleniyor", "5/5 · SİNYAL"];
 
 function Chip({ ok, label, active }: { ok: boolean; label: string; active: boolean }) {
   return (
@@ -15,11 +15,11 @@ function Chip({ ok, label, active }: { ok: boolean; label: string; active: boole
   );
 }
 
-/** KANAL stratejisi tarama tablosu: her satırda dört koşulun durumu (band kırıldı → döndü → CCI → RSI). */
+/** KANAL stratejisi tarama tablosu: her satırda koşulların durumu (band kırıldı → içeri kapanış → CCI → RSI → sıra → yön) + güven. */
 export default function KanalTable({
-  items, limit, onlyActive = false, rsiOb = 70, rsiOs = 30, ruleSymbols, onAdd, onSelect,
+  items, limit, onlyActive = false, rsiOb = 70, rsiOs = 30, autoMin, ruleSymbols, onAdd, onSelect,
 }: {
-  items: KanalItem[]; limit?: number; onlyActive?: boolean; rsiOb?: number; rsiOs?: number;
+  items: KanalItem[]; limit?: number; onlyActive?: boolean; rsiOb?: number; rsiOs?: number; autoMin?: number;
   ruleSymbols?: string[]; onAdd?: (symbol: string, tf: string) => void; onSelect?: (symbol: string, tf: string) => void;
 }) {
   let list = onlyActive ? items.filter((i) => i.stage >= 1) : items;
@@ -32,10 +32,10 @@ export default function KanalTable({
     );
   return (
     <div className="scroll-thin overflow-x-auto">
-      <table className="w-full min-w-[820px] text-sm">
+      <table className="w-full min-w-[900px] text-sm">
         <thead>
           <tr className="text-left text-[10px] uppercase tracking-widest text-slate-500">
-            <th className="pb-1.5">Parite</th><th>TF</th><th className="text-right">Fiyat</th><th>Band</th><th>RSI</th><th className="text-right">CCI / MA</th><th>Koşullar</th><th className="text-right">Durum</th>
+            <th className="pb-1.5">Parite</th><th>TF</th><th className="text-right">Fiyat</th><th>Band</th><th>RSI</th><th className="text-right">CCI / MA</th><th>Koşullar</th><th className="text-right">Güven</th><th className="text-right">Durum</th>
           </tr>
         </thead>
         <tbody>
@@ -65,7 +65,16 @@ export default function KanalTable({
                     <Chip ok={i.checks.ret} label="Dönüş" active={act} />
                     <Chip ok={i.checks.cci} label="CCI" active={act} />
                     <Chip ok={i.checks.rsi} label="RSI" active={act} />
+                    <Chip ok={!!i.checks.seq} label="Sıra" active={act} />
+                    <Chip ok={!!i.checks.agree} label="Yön" active={act} />
                   </div>
+                </td>
+                <td className="num text-right text-xs">
+                  {act && i.confidence ? (
+                    <span className={cx("font-bold", i.confidence >= (autoMin ?? 80) ? "text-amber-200" : "text-slate-300")} title={i.confidence >= (autoMin ?? 80) ? "Otomatik işlem eşiğinin üstünde" : undefined}>
+                      %{i.confidence}{i.confidence >= (autoMin ?? 80) ? " ⚡" : ""}
+                    </span>
+                  ) : <span className="text-slate-600">—</span>}
                 </td>
                 <td className="text-right">
                   {i.side && i.stage >= 2 ? (

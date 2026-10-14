@@ -49,12 +49,29 @@ mevcut klasörünüzün üzerine kopyalayın (`config.json` değişmez), sonra a
 ## KANAL stratejisi (v2.7)
 `kanal_strategy.py` + `mql5/` klasörü: KANAL3BAND bandını kırıp geri dönüş + RSI 70/30 + CCI mor çizgi (CCI MA) kesişimi.
 - Ajan, MT5 **Piyasa Gözlemi'nde açık olan tüm pariteleri** seçili zaman dilimlerinde tarar (ayarlar panelde: *KANAL Strateji*).
-- 4/4 koşul ilk kez sağlandığında sinyal üretir; JARVIS sesli sorar, yalnızca "Evet" ile emir gider.
+- Koşullar ilk kez tamamlandığında (5/5) sinyal üretir; Otomatik İşlem kapalıyken JARVIS sesli sorar, yalnızca "Evet" ile emir gider.
 - **Ajan güncelleme:** `app.py`, `mt5_engine.py`, `kanal_strategy.py` dosyalarını mevcut klasörün üzerine kopyalayın, ajanı yeniden başlatın.
 - **MQL5 dosyaları:** panelde *MQL5 Stratejileri* sayfasında kayıtlıdır; "Derle" ile ajan MetaEditor'da derler
   (`MQL5\\Indicators\\Jarvis\\` ve `MQL5\\Experts\\Jarvis\\` altına yazılır). EA'yı bir grafiğe sürükleyin
   (Algo Trading açık). `InpAutoTrade` varsayılan **false** — yalnızca uyarı verir.
 - Centered YSR merkez çizgisi yeniden boyanır; strateji yalnızca kapanmış barlarda sağ uçtaki değerlerle çalışır.
+
+## v2.9 — KANAL otomatik işlem
+- **Kural sırası:** İLK kural fiyatın band aralığında **mum kapatması** (dönüş barı); RSI ve CCI onayı yalnızca dönüş barından
+  itibaren sayılır (`strictOrder`). Ardından RSI ve CCI son `confirmBars` barda **arka arkaya aynı yönde** olmalıdır (yön onayı).
+  Tabloda yeni **Sıra** ve **Yön** rozetleri; aşamalar 0–5.
+- **Güven skoru** (panel = ajan = EA): 40 + 12×kırılan band + 10×sıra + 10×yön + RSI aşırılığı (≤12) + CCI aşırılığı (≤8), en çok 97.
+- **SL:** ALIŞ → önceki dip veya RSI'ın dönüş yaptığı barın dibi (daha korumalı olan) − ATR payı; SATIŞ → tepe / RSI dönüş barının tepesi + ATR payı.
+  **TP:** ALIŞ → girişin üstündeki **en yakın üst band**, SATIŞ → girişin altındaki **en yakın alt band** (sinyalin geldiği zaman diliminin değerleri).
+- **Otomatik İşlem** (panel → KANAL Strateji → ⚡ Otomatik İşlem, varsayılan **KAPALI**): güven ≥ `autoMinConfidence` (%80) **ve** sıra ✓ **ve** yön ✓
+  olan sinyaller sorulmadan MT5'e gönderilir (`JARVIS AUTO <YÖN> <TF>` yorumuyla). Eşiği geçmeyenler eskisi gibi onayınıza sunulur.
+  Korumalar: Algo Trading/işlem izni, aynı paritede açık JARVIS işlemi yok, en çok `autoMaxOpen` (3) açık işlem, aynı bar için tek emir
+  (yeniden başlatmada da `.jarvis_state.json` ile korunur). Panelde sinyal ⚡ otomatik rozetiyle `executed`/`failed` olarak görünür.
+- **Breakeven:** JARVIS işlemi hedef yolunun `breakEvenPct`'sine (%30) ulaşınca SL giriş fiyatına çekilir (ajan `manage` iş parçacığı, 3 sn;
+  EA'da `ManageBreakEven`). Stops level engelliyorsa sonraki turda yeniden denenir.
+- **EA (KANAL_Strateji.mq5 v1.10):** aynı kurallar; yeni girişler `InpStrictOrder`, `InpConfirmBars`, `InpSlAnchor`, `InpTpMode`, `InpAutoMinConf`,
+  `InpMaxOpen`, `InpBreakEvenPct`. Ajanla birlikte kullanıyorsanız EA'da `InpAutoTrade` kapalı kalsın (çift emir açılmasın).
+- Ajan: panel erişilemediğinde gönderilemeyen sinyaller kaybolmaz, bir sonraki senkronda yeniden denenir.
 
 ## v2.8 — fiyat akışı, emir doğrulama, güncelleme
 - **Canlı fiyat akışı:** ajan her saniye bid/ask gönderir; panel grafiği ve fiyat listesi bununla akar (durum şeridinde "canlı · 0.8 sn").

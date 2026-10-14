@@ -82,7 +82,7 @@ export default function KanalView() {
     <div>
       <PageHeader
         title="KANAL STRATEJİ"
-        sub="KANAL3BAND bandını kırıp geri dönüş + RSI + CCI mor çizgi (MA) kesişimi. Piyasa Gözlemi'ndeki tüm pariteler taranır."
+        sub="KANAL3BAND bandını kırıp band içine kapanış → RSI + CCI onayı (aynı yönde). Piyasa Gözlemi'ndeki tüm pariteler taranır; istenirse otomatik işlem."
         right={data && (
           <div className="flex items-center gap-2">
             <Badge tone={data.live ? "green" : "amber"}>{data.live ? "CANLI · MT5 Piyasa Gözlemi" : "DEMO VERİ"}</Badge>
@@ -100,24 +100,31 @@ export default function KanalView() {
               <div className="mb-1 font-black text-rose-300">▼ SATIŞ</div>
               <ol className="list-decimal space-y-1 pl-4 text-slate-300">
                 <li>Fiyat <b>üst bandı</b> yukarı kırar</li>
-                <li>Kapanış tekrar band <b>içine</b> döner</li>
-                <li>CCI, mor çizgiyi (CCI MA) <b>aşağı</b> keser</li>
+                <li><b>İLK KURAL:</b> mum band <b>içinde</b> kapanır (dönüş barı)</li>
+                <li>Dönüşten <b>sonra</b> CCI, mor çizgiyi (CCI MA) <b>aşağı</b> keser</li>
                 <li>RSI <b>{p?.rsiOb ?? 70} altında</b>{p?.sellRsiMode === "crossDown" ? " (aşağı kesmiş)" : ""}</li>
+                <li>RSI ve CCI son {Math.max(1, p?.confirmBars ?? 1)} barda <b>arka arkaya aşağı</b> (yön onayı)</li>
               </ol>
+              <div className="mt-2 text-xs text-slate-400">SL: tepe / RSI dönüş barı + ATR payı · TP: girişin altındaki <b>en yakın alt band</b></div>
             </div>
             <div className="rounded-xl border border-emerald-400/30 bg-emerald-400/5 p-3">
               <div className="mb-1 font-black text-emerald-300">▲ ALIŞ</div>
               <ol className="list-decimal space-y-1 pl-4 text-slate-300">
                 <li>Fiyat <b>alt bandı</b> aşağı kırar</li>
-                <li>Kapanış tekrar band <b>içine</b> döner</li>
-                <li>CCI, mor çizgiyi (CCI MA) <b>yukarı</b> keser</li>
+                <li><b>İLK KURAL:</b> mum band <b>içinde</b> kapanır (dönüş barı)</li>
+                <li>Dönüşten <b>sonra</b> CCI, mor çizgiyi (CCI MA) <b>yukarı</b> keser</li>
                 <li>RSI <b>{p?.rsiOs ?? 30}&apos;u yukarı</b> keser{p?.buyRsiMode === "above" ? " (üstünde yeterli)" : ""}</li>
+                <li>RSI ve CCI son {Math.max(1, p?.confirmBars ?? 1)} barda <b>arka arkaya yukarı</b> (yön onayı)</li>
               </ol>
+              <div className="mt-2 text-xs text-slate-400">SL: önceki dip / RSI dönüş barı − ATR payı · TP: girişin üstündeki <b>en yakın üst band</b></div>
             </div>
           </div>
           <p className="mt-3 text-xs text-slate-400">
-            Sinyal yalnızca kapanmış barda ve koşulların <b>ilk kez</b> tamamlandığı anda bir kez oluşur. Sinyal tek başına işlem açmaz:
-            JARVIS sana sorar, yalnızca açık bir <b>“Evet”</b> ile emir gider. Take profit merkez çizgi, stop loss kırılımın ucu + ATR payıdır.
+            Sinyal yalnızca kapanmış barda, koşulların <b>ilk kez</b> tamamlandığı anda bir kez oluşur; RSI/band değerleri sinyalin geldiği zaman diliminden alınır.
+            <b> Güven</b> = 40 + 12×kırılan band + 10×sıra + 10×yön + RSI/CCI aşırılığı (en çok 97).
+            {p?.autoTrade
+              ? <> <b className="text-amber-200">Otomatik İşlem AÇIK:</b> güven ≥ %{p.autoMinConfidence}, sıra ✓ ve yön ✓ olan sinyaller <u>sorulmadan</u> gönderilir; diğerlerini JARVIS sorar.</>
+              : <> Otomatik İşlem kapalı: JARVIS sorar, yalnızca açık bir <b>“Evet”</b> ile emir gider.</>}
           </p>
         </Card>
 
@@ -152,6 +159,26 @@ export default function KanalView() {
                 MT5 <b>Piyasa Gözlemi&apos;nde açık olan TÜM pariteleri</b> tara <span className="text-xs text-slate-500">(kapalıysa yalnızca İzleme Kuralları)</span>
               </label>
 
+              <div className={cx("rounded-xl border p-3 transition", p?.autoTrade ? "border-amber-400/50 bg-amber-400/5" : "border-slate-600/30 bg-black/20")}>
+                <label className="flex cursor-pointer items-center justify-between gap-3">
+                  <span className="text-sm font-bold text-slate-100">⚡ Otomatik İşlem <span className="ml-1 text-xs font-normal text-slate-400">(sormadan emir gönder)</span></span>
+                  <button type="button" onClick={() => patch({}, { autoTrade: !p?.autoTrade })} className={cx("relative h-6 w-12 rounded-full border transition", p?.autoTrade ? "border-amber-400/70 bg-amber-400/30" : "border-slate-600 bg-slate-800")} title="Otomatik işlemi aç/kapat">
+                    <span className={cx("absolute top-[2px] h-[18px] w-[18px] rounded-full transition-all", p?.autoTrade ? "left-[27px] bg-amber-200 shadow-[0_0_10px_rgba(251,191,36,0.9)]" : "left-[2px] bg-slate-400")} />
+                  </button>
+                </label>
+                <p className="mt-1 text-[11px] text-slate-400">
+                  Açıkken: güven ≥ eşik <b>ve</b> band içine kapanış → RSI &amp; CCI onayı (sıra ✓) <b>ve</b> RSI/CCI aynı yönde (yön ✓) olan sinyaller MT5&apos;e <u>onay istenmeden</u> gönderilir.
+                  Aynı paritede açık JARVIS işlemi varsa veya tavan dolduysa sinyal onayına sunulur. Kâr hedefin %{p?.breakEvenPct ?? 30}&apos;una ulaşınca SL girişe çekilir.
+                </p>
+                {p?.autoTrade && (
+                  <div className="mt-2 grid grid-cols-3 gap-3">
+                    <Field label="Min. güven (%)" hint="50–97">{num("autoMinConfidence")}</Field>
+                    <Field label="En çok açık işlem" hint="1–20">{num("autoMaxOpen")}</Field>
+                    <Field label="Breakeven (%TP)" hint="0 = kapalı">{num("breakEvenPct")}</Field>
+                  </div>
+                )}
+              </div>
+
               <button onClick={() => setAdv(!adv)} className="text-xs font-bold text-cyan-400 hover:underline">{adv ? "▾" : "▸"} Gelişmiş ayarlar</button>
               {adv && p && (
                 <div className="space-y-3 rounded-xl border border-slate-600/30 bg-black/20 p-3">
@@ -182,6 +209,23 @@ export default function KanalView() {
                       </select>
                     </Field>
                   </div>
+                  <div className="grid grid-cols-3 gap-3">
+                    <Field label="Yön onayı bar sayısı" hint="RSI & CCI arka arkaya aynı yön · 0 = kapalı">{num("confirmBars")}</Field>
+                    <Field label="SL çapası">
+                      <select className="input" value={p.slAnchor} onChange={(e) => patch({}, { slAnchor: e.target.value as KanalParams["slAnchor"] })}>
+                        <option value="swingRsi">Önceki dip/tepe + RSI dönüş barı</option><option value="break">Yalnız kırılım ucu</option>
+                      </select>
+                    </Field>
+                    <Field label="Take profit">
+                      <select className="input" value={p.tpMode} onChange={(e) => patch({}, { tpMode: e.target.value as KanalParams["tpMode"] })}>
+                        <option value="nearestBand">En yakın karşı band</option><option value="center">Merkez çizgi</option>
+                      </select>
+                    </Field>
+                  </div>
+                  <label className="flex items-center gap-2 text-sm text-slate-300">
+                    <input type="checkbox" className="accent-cyan-400" checked={p.strictOrder} onChange={(e) => patch({}, { strictOrder: e.target.checked })} />
+                    Sıra zorunlu: önce band içine kapanış, RSI/CCI onayı yalnızca dönüş barından itibaren sayılır
+                  </label>
                   <label className="flex items-center gap-2 text-sm text-slate-300">
                     <input type="checkbox" className="accent-cyan-400" checked={p.breakByClose} onChange={(e) => patch({}, { breakByClose: e.target.checked })} />
                     Kırılım için kapanış gerekli (kapalıysa fitil yeterli)
@@ -215,12 +259,12 @@ export default function KanalView() {
                 Ajan bağlı ama henüz tarama verisi gelmedi. Ajanı güncelleyin (<Link href="/agent" className="text-cyan-300 underline">Yerel Ajan</Link>: app.py, mt5_engine.py, kanal_strategy.py) ve yeniden başlatın.
               </div>
             )}
-            <KanalTable items={data.items} onlyActive={only} rsiOb={p?.rsiOb} rsiOs={p?.rsiOs} ruleSymbols={data.ruleSymbols} onAdd={(s) => addChart(s)}
+            <KanalTable items={data.items} onlyActive={only} rsiOb={p?.rsiOb} rsiOs={p?.rsiOs} autoMin={p?.autoMinConfidence} ruleSymbols={data.ruleSymbols} onAdd={(s) => addChart(s)}
               onSelect={(s) => { if (data.ruleSymbols.includes(s.toUpperCase())) window.location.href = `/market?symbol=${s}`; }} />
           </>
         )}
         <p className="mt-3 text-[11px] text-slate-500">
-          Koşullar sırasıyla: <b>Band</b> kırıldı → <b>Dönüş</b> band içine kapanış → <b>CCI</b> MA kesişimi → <b>RSI</b> şartı. 4/4 olduğunda JARVIS sana sesli sorar.
+          Koşullar sırasıyla: <b>Band</b> kırıldı → <b>Dönüş</b> band içine kapanış → <b>CCI</b> MA kesişimi → <b>RSI</b> şartı → <b>Sıra</b> (onaylar dönüşten sonra) → <b>Yön</b> (RSI &amp; CCI aynı yönde). 5/5 olduğunda JARVIS sana sesli sorar; Otomatik İşlem açıksa ⚡ işaretli (eşiği geçen) sinyaller sorulmadan gönderilir.
           {!data?.live && " Demo modunda sentetik veri taranır; gerçek pariteler için ajanı çalıştırın."}
         </p>
       </Card>

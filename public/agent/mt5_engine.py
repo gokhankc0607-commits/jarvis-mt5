@@ -99,6 +99,7 @@ class Position:
     tp: float
     pnl: float
     comment: str = ""
+    magic: int = 0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -348,7 +349,7 @@ class MT5Engine:
             out.append(Position(
                 ticket=p.ticket, symbol=p.symbol, side="BUY" if p.type == mt5.POSITION_TYPE_BUY else "SELL",
                 volume=p.volume, openPrice=p.price_open, currentPrice=p.price_current, sl=p.sl, tp=p.tp,
-                pnl=round(p.profit + p.swap, 2), comment=p.comment,
+                pnl=round(p.profit + p.swap, 2), comment=p.comment, magic=int(getattr(p, "magic", 0) or 0),
             ))
         return out
 
@@ -616,7 +617,7 @@ class MT5Engine:
             bid, ask = self.tick(symbol)
             price = ask if is_buy else bid
             t = random.randint(10_000_000, 99_999_999)
-            self._sim_positions.append(Position(t, symbol, side, volume, price, price, sl or 0, tp or 0, 0.0, comment))
+            self._sim_positions.append(Position(t, symbol, side, volume, price, price, sl or 0, tp or 0, 0.0, comment, self.magic))
             return OrderResult(True, t, price, 10009, "SIM DONE")
         if not self.ensure_connected():
             return OrderResult(False, retcode=10031, message="MT5 terminaline bağlı değil.")
@@ -730,6 +731,48 @@ class MT5Engine:
                 break
             time.sleep(0.25)
         return last
+
+    @_locked
+    def modify_position(self, ticket: int, sl: float | None, tp: float | None) -> OrderResult:
+        """Açık pozisyonun SL/TP'sini değiştir (TRADE_ACTION_SLTP). Breakeven için kullanılır.
+        SL güncel fiyata stops/freeze mesafesinden yakınsa gönderilmez (retcode 10016 ile döner; sonra tekrar denenir)."""
+        if self.simulate:
+            for p in self._sim_positions:
+                if p.ticket == int(ticket):
+                    p.sl = float(sl or 0.0)
+                    p.tp = float(tp or p.tp or 0.0)
+                    return OrderResult(True, p.ticket, p.currentPrice, 10009, "SIM MODIFIED")
+            return OrderResult(False, message="pozisyon yok")
+        if not self.ensure_connected():
+            return OrderResult(False, retcode=10031, message="MT5 terminaline bağlı değil.")
+        ti = mt5.terminal_info()
+        if ti is not None and not ti.trade_allowed:
+            return OrderResult(False, retcode=10027, message=ALGO_HINT)
+        pos = mt5.positions_get(ticket=int(ticket))
+        if not pos:
+            return OrderResult(False, message="pozisyon bulunamadı (zaten kapanmış olabilir)")
+        p = pos[0]
+        info = mt5.symbol_info(p.symbol)
+        tick = mt5.symbol_info_tick(p.symbol)
+        if info is None or tick is None:
+            return OrderResult(False, retcode=10021, message=f"{p.symbol} için sembol/fiyat bilgisi yok")
+        digits = int(info.digits)
+        point = info.point or 10 ** (-digits)
+        is_buy = p.type == mt5.POSITION_TYPE_BUY
+        ref = tick.bid if is_buy else tick.ask
+        min_dist = max(info.trade_stops_level, info.trade_freeze_level) * point + (tick.ask - tick.bid) + 2 * point
+        new_sl = round(float(sl), digits) if sl else 0.0
+        new_tp = round(float(tp), digits) if tp else float(p.tp or 0.0)
+        if new_sl and ((is_buy and ref - new_sl < min_dist) or ((not is_buy) and new_sl - ref < min_dist)):
+            return OrderResult(False, retcode=10016, message=f"SL güncel fiyata çok yakın (min {min_dist / point:.0f} puan); sonra tekrar denenecek")
+        req = {"action": mt5.TRADE_ACTION_SLTP, "position": int(p.ticket), "symbol": p.symbol,
+               "sl": new_sl, "tp": new_tp, "magic": self.magic}
+        res = mt5.order_send(req)
+        if res is None:
+            return OrderResult(False, message=f"order_send None: {mt5.last_error()}")
+        if res.retcode in (10009, 10008, 10010, 10025):   # 10025 = değişiklik yok
+            return OrderResult(True, p.ticket, ref, res.retcode, f"SL {new_sl} TP {new_tp}")
+        return OrderResult(False, retcode=res.retcode, message=describe_retcode(res.retcode, res.comment))
 
     @_locked
     def close_position(self, ticket: int) -> OrderResult:

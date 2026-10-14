@@ -27,7 +27,7 @@ export default function CommandCenter() {
   const toast = useToast();
   const [state, setState] = useState<StateT | null>(null);
   const [market, setMarket] = useState<MarketT | null>(null);
-  const [kanal, setKanal] = useState<{ items: KanalItem[]; live: boolean; watch: string[]; settings: { enabled: boolean; timeframes: string; params: { rsiOb: number; rsiOs: number } } } | null>(null);
+  const [kanal, setKanal] = useState<{ items: KanalItem[]; live: boolean; watch: string[]; settings: { enabled: boolean; timeframes: string; params: { rsiOb: number; rsiOs: number; autoTrade?: boolean; autoMinConfidence?: number } } } | null>(null);
   const [msgs, setMsgs] = useState<Msg[]>([]);
   const [mode, setMode] = useState<OrbMode>("idle");
   const [input, setInput] = useState("");
@@ -44,6 +44,7 @@ export default function CommandCenter() {
   const [orbSize, setOrbSize] = useState(470);
   const level = useRef(0);
   const seenSignals = useRef<Set<number> | null>(null);
+  const seenAuto = useRef<Set<number> | null>(null);
   const recRef = useRef<SR>(null);
   const audioRef = useRef<{ ctx: AudioContext; stream: MediaStream; raf: number } | null>(null);
   const histEnd = useRef<HTMLDivElement>(null);
@@ -71,6 +72,22 @@ export default function CommandCenter() {
         const fresh = s.pendingSignals.filter((x) => !seenSignals.current!.has(x.id));
         fresh.forEach((x) => seenSignals.current!.add(x.id));
         if (fresh[0]) announce(fresh[0]);
+      }
+      // Otomatik açılan KANAL işlemleri (ajan sormadan gönderdi) -> bildirim
+      const autos = s.recentSignals.filter((x) => (x.note ?? "").startsWith("OTOMATİK"));
+      if (seenAuto.current === null) {
+        seenAuto.current = new Set(autos.map((x) => x.id));
+      } else {
+        const fresh = autos.filter((x) => !seenAuto.current!.has(x.id));
+        fresh.forEach((x) => {
+          seenAuto.current!.add(x.id);
+          const ok = x.status === "executed";
+          const txt = ok
+            ? `${x.symbol} ${x.side === "BUY" ? "alış" : "satış"} işlemi otomatik açıldı efendim. Güven yüzde ${x.confidence}.`
+            : `${x.symbol} otomatik ${x.side === "BUY" ? "alış" : "satış"} emri gönderilemedi efendim.`;
+          toast(`${ok ? "⚡ Otomatik işlem" : "⚠ Otomatik işlem başarısız"}: ${x.symbol} ${x.side}`, ok ? "ok" : "err");
+          setMsgs((m) => [...m, { id: -Date.now() - x.id, role: "assistant", content: txt, createdAt: new Date().toISOString() }]);
+        });
       }
     } catch {}
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -766,14 +783,15 @@ export default function CommandCenter() {
         <HudTitle icon={<IconSignal />} right={
           <span className="flex items-center gap-3 text-[11px] font-bold">
             {kanal && <Badge tone={kanal.settings.enabled ? "green" : "slate"}>{kanal.settings.enabled ? "AÇIK" : "KAPALI"}</Badge>}
+            {kanal?.settings.params.autoTrade && <Badge tone="amber">⚡ OTOMATİK ≥ %{kanal.settings.params.autoMinConfidence ?? 80}</Badge>}
             {kanal && <Badge tone="cyan">{kanal.watch.length} parite · {kanal.settings.timeframes}</Badge>}
             {kanal && kanal.items.some((i) => i.fire) && <Badge tone="amber">{kanal.items.filter((i) => i.fire).length} yeni sinyal</Badge>}
             <Link href="/kanal" className="text-cyan-400 hover:underline">ayarlar / tüm tarama →</Link>
           </span>
         }>KANAL Strateji — Piyasa Gözlemi</HudTitle>
-        {!kanal ? <Skeleton rows={3} /> : <KanalTable items={kanal.items} onlyActive limit={8} rsiOb={kanal.settings.params.rsiOb} rsiOs={kanal.settings.params.rsiOs} onSelect={(symbol) => { const q = quotes.find((x) => x.symbol === symbol); if (q) setSel({ symbol, tf: q.tfs[0] }); }} />}
+        {!kanal ? <Skeleton rows={3} /> : <KanalTable items={kanal.items} onlyActive limit={8} rsiOb={kanal.settings.params.rsiOb} rsiOs={kanal.settings.params.rsiOs} autoMin={kanal.settings.params.autoMinConfidence} onSelect={(symbol) => { const q = quotes.find((x) => x.symbol === symbol); if (q) setSel({ symbol, tf: q.tfs[0] }); }} />}
         <p className="mt-2 text-[11px] text-slate-500">
-          Üst/alt bandı kırıp içeri dönen, CCI mor çizgiyi (MA) kesen ve RSI 70/30 şartını sağlayan pariteler. 4/4 olunca JARVIS sesli onay ister; “Evet” demeden işlem açılmaz.
+          Üst/alt bandı kırıp içeri kapanan, ardından CCI mor çizgiyi (MA) kesen ve RSI şartını sağlayan pariteler (sıra + yön onayıyla). 5/5 olunca JARVIS sesli onay ister; Otomatik İşlem açıksa güven eşiğini geçenler (⚡) sorulmadan gönderilir.
         </p>
       </HudPanel>
 

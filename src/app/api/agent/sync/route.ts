@@ -9,7 +9,12 @@ import { LATEST_AGENT } from "@/lib/version";
 import { ensureKanal } from "@/lib/kanalStore";
 
 type Pos = { ticket: string | number; symbol: string; side: string; volume: number; openPrice: number; currentPrice: number; sl?: number; tp?: number; pnl: number; comment?: string };
-type Sig = { symbol: string; side: string; timeframe?: string; price: number; sl?: number; tp?: number; volume?: number; reason?: string; indicators?: Record<string, number | string | boolean>; confidence?: number };
+type Sig = {
+  symbol: string; side: string; timeframe?: string; price: number; sl?: number; tp?: number; volume?: number; reason?: string;
+  indicators?: Record<string, number | string | boolean>; confidence?: number;
+  /** Ajan sinyali OTOMATİK yürüttüyse (KANAL otomatik işlem): sonuç burada gelir, sinyal doğrudan executed/failed kaydedilir */
+  auto?: { status?: string; ticket?: number | null; price?: number | null; note?: string } | null;
+};
 
 export async function POST(req: Request) {
   const u = await userFromAgentKey(req.headers.get("x-agent-key"));
@@ -76,16 +81,24 @@ export async function POST(req: Request) {
   let created = 0;
   if (Array.isArray(b.signals)) {
     for (const s of b.signals as Sig[]) {
-      const dup = await db
-        .select({ id: signals.id })
-        .from(signals)
-        .where(and(eq(signals.userId, u.id), eq(signals.symbol, s.symbol), eq(signals.side, s.side), eq(signals.timeframe, s.timeframe ?? "H1"), gt(signals.createdAt, new Date(Date.now() - 30 * 60000))))
-        .limit(1);
-      if (dup.length) continue;
+      if (!s || typeof s.symbol !== "string" || !Number.isFinite(Number(s.price))) continue;
+      const auto = s.auto && typeof s.auto === "object" ? s.auto : null;
+      if (!auto) {
+        const dup = await db
+          .select({ id: signals.id })
+          .from(signals)
+          .where(and(eq(signals.userId, u.id), eq(signals.symbol, s.symbol), eq(signals.side, s.side), eq(signals.timeframe, s.timeframe ?? "H1"), gt(signals.createdAt, new Date(Date.now() - 30 * 60000))))
+          .limit(1);
+        if (dup.length) continue;
+      }
       await db.insert(signals).values({
         userId: u.id, symbol: s.symbol, side: s.side === "SELL" ? "SELL" : "BUY", timeframe: s.timeframe ?? "H1",
         price: s.price, sl: s.sl ?? null, tp: s.tp ?? null, volume: s.volume ?? 0.1, reason: s.reason ?? "",
         indicators: s.indicators ?? {}, confidence: s.confidence ?? 50, source: "agent",
+        // Otomatik işlem: ajan emri zaten gönderdi -> onay akışına girmez, sonucu olduğu gibi kaydedilir
+        ...(auto
+          ? { status: auto.status === "executed" ? "executed" : "failed", note: String(auto.note ?? "").slice(0, 500), decidedAt: now }
+          : {}),
       });
       created++;
     }

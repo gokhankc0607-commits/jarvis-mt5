@@ -32,11 +32,11 @@ import requests
 
 from local_ai import JarvisBrain, LLMClient, SpeechToText, TextToSpeech, has_wake_word, is_no, is_yes
 from mql5_compiler import MQL5Compiler
-from kanal_strategy import KanalParams, kanal_analyze, kanal_levels
+from kanal_strategy import KanalParams, kanal_analyze, levels_from_result
 from mt5_engine import ALGO_HINT, TIMEFRAMES, MT5Engine, SignalCandidate, WatchRule
 
 log = logging.getLogger("jarvis")
-AGENT_VERSION = "2.8.1"
+AGENT_VERSION = "2.9.0"
 # PyInstaller ile paketlendiğinde config / modeller .exe'nin yanındaki klasörden okunur
 ROOT = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
 
@@ -145,8 +145,13 @@ class Jarvis:
         self.asked: set[int] = set()
         st = load_state()
         self.executed: set[int] = {int(x) for x in st.get("executed", []) if str(x).isdigit()}
-        if self.executed:
-            log.info("Önceki oturumdan %d gönderilmiş sinyal kimliği yüklendi (mükerrer emir koruması)", len(self.executed))
+        # Otomatik açılan işlemler: "SEMBOL|TF|YÖN" -> bar zamanı (yeniden başlatmada aynı bar için ikinci emir açılmasın)
+        self._auto_fired: dict[str, int] = {str(k): int(v) for k, v in (st.get("autoFired") or {}).items() if str(v).lstrip("-").isdigit()}
+        self._be_done: set[int] = set()        # SL'si girişe çekilmiş biletler (tekrar denenmesin)
+        self._auto_warned = 0.0
+        if self.executed or self._auto_fired:
+            log.info("Önceki oturumdan %d gönderilmiş sinyal, %d otomatik işlem anahtarı yüklendi (mükerrer emir koruması)",
+                     len(self.executed), len(self._auto_fired))
         self.compile_q: "queue.Queue[dict]" = queue.Queue()
         self.voice_q: "queue.Queue[dict]" = queue.Queue()
         self.lock = threading.Lock()
@@ -166,9 +171,13 @@ class Jarvis:
     def _set_level(self, v: float) -> None:
         self.level = v
 
+    def _save_state(self) -> None:
+        recent = dict(sorted(self._auto_fired.items(), key=lambda kv: kv[1])[-200:])
+        save_state({"executed": sorted(self.executed)[-500:], "autoFired": recent})
+
     def _mark_executed(self, sid: int) -> None:
         self.executed.add(sid)
-        save_state({"executed": sorted(self.executed)[-500:]})
+        self._save_state()
 
     def speak(self, text: str) -> None:
         if self.tts:
@@ -198,6 +207,7 @@ class Jarvis:
         threading.Thread(target=self.scan_loop, daemon=True, name="scan").start()
         threading.Thread(target=self.market_loop, daemon=True, name="market").start()
         threading.Thread(target=self.quote_loop, daemon=True, name="quotes").start()
+        threading.Thread(target=self.manage_loop, daemon=True, name="manage").start()
         log.info("JARVIS ajan v%s başlatıldı", AGENT_VERSION)
         threading.Thread(target=self.compile_worker, daemon=True, name="compile").start()
         if self.voice_enabled:
@@ -217,6 +227,7 @@ class Jarvis:
     def sync_loop(self) -> None:
         interval = self.cfg.get("sync_interval", 2.0)
         while not self.stop.is_set():
+            out: list[dict] = []
             try:
                 acc = self.engine.account()
                 pos_objs = self.engine.positions(strict=True) if acc.connected else []
@@ -246,11 +257,15 @@ class Jarvis:
                            "agent": {"version": AGENT_VERSION, "algo": acc.algo, "tradeAllowed": acc.tradeAllowed, "build": acc.build}}
                 resp = self.dash.sync(payload)
                 self.closed_buf = []
+                out = []
                 self.handle_sync(resp)
             except requests.RequestException as e:
                 log.warning("Panel erişilemedi: %s", e)
             except Exception as e:  # noqa: BLE001
                 log.exception("sync hatası: %s", e)
+            if out:  # gönderilemeyen sinyaller (özellikle otomatik işlem kayıtları) bir sonraki turda tekrar denensin
+                with self.lock:
+                    self.outbox = out + self.outbox
             time.sleep(interval)
 
     def handle_sync(self, resp: dict) -> None:
@@ -295,7 +310,7 @@ class Jarvis:
             else:
                 log.error("✗ Emir reddedildi: %s %s — %s", s["symbol"], s["side"], r.message)
                 self.executed.discard(s["id"])  # panelden "Tekrar dene" ile yeniden gönderilebilsin
-                save_state({"executed": sorted(self.executed)[-500:]})
+                self._save_state()
                 self.dash.report({"type": "signal", "id": s["id"], "status": "failed", "note": r.message[:480]})
                 short = "MT5'te Algo Trading kapalı. Üstteki Algo Trading düğmesini açın." if r.retcode == 10027 else r.message[:160]
                 self.voice_q.put({"say": f"Dikkat efendim, {s['symbol']} emri gönderilemedi. {short}"})
@@ -372,22 +387,130 @@ class Jarvis:
                 try:
                     bid, ask = self.engine.tick(sym)
                     entry = ask if res["side"] == "BUY" else bid
-                    sl, tp = kanal_levels(res["side"], entry, res["extreme"], res["center"], res["atr"], params.slBufferAtr)
+                    sl, tp = levels_from_result(res, entry, params)   # SL: önceki dip/tepe veya RSI dönüş barı · TP: en yakın karşı band
                 except Exception:  # noqa: BLE001
                     entry, sl, tp = res["entry"], res["sl"], res["tp"]
                 digits = 2 if entry > 1000 else 3 if entry > 50 else 5
                 strength = int(res.get("strength", 1))
+                ch = res.get("checks") or {}
                 cand = SignalCandidate(
                     symbol=sym, side=res["side"], timeframe=tf, price=round(entry, digits), sl=round(sl, digits),
                     tp=round(tp, digits), volume=lot, reason="KANAL: " + res["reason"],
-                    confidence=int(min(95, 62 + 10 * strength + abs((res["rsi"] or 50) - 50) / 5)),
+                    confidence=int(res.get("confidence", 0)),
                     indicators={"RSI": round(res["rsi"] or 0, 1), "CCI": round(res["cci"] or 0, 1),
-                                "CCI_MA": round(res["cciMa"] or 0, 1), "Band": params.band, "kırılan band": strength},
+                                "CCI_MA": round(res["cciMa"] or 0, 1), "Band": params.band, "kırılan band": strength,
+                                "sıra": "✓" if ch.get("seq") else "✗", "yön": "✓" if ch.get("agree") else "✗",
+                                "SL çapası": round(res["anchor"], digits) if res.get("anchor") else 0},
                 )
                 log.info("⚡ KANAL sinyal: %s %s %s — %s", sym, tf, res["side"], res["reason"])
+                mode, auto = self.try_auto_trade(sym, tf, res, cand, params, entry)
+                if mode == "skip":
+                    continue
+                payload = cand.to_dict()
+                if auto:
+                    payload["auto"] = auto
                 with self.lock:
-                    self.outbox.append(cand.to_dict())
+                    self.outbox.append(payload)
         self.dash.market({"scan": items, "watch": symbols})
+
+    # ------------------------------------------------------------------ otomatik işlem
+    def try_auto_trade(self, sym: str, tf: str, res: dict, cand: SignalCandidate, params: KanalParams,
+                       entry: float) -> tuple[str, Optional[dict]]:
+        """Otomatik giriş kararı. Döner: ("ask", None) -> normal akış (JARVIS sorar) · ("skip", None) -> hiç gönderme ·
+        ("auto", {...}) -> emir denendi, sonucu panele 'auto' alanıyla bildirilir.
+
+        Kurallar (kullanıcı tanımı): panelde Otomatik İşlem AÇIK, güven ≥ eşik, İLK kural band içine kapanış sağlanmış,
+        RSI ve CCI onayı dönüşten SONRA ve arka arkaya aynı yönde (sıra ✓ · yön ✓). Güvenlik: Algo Trading açık,
+        aynı paritede açık JARVIS işlemi yok, toplam otomatik açık işlem tavanı aşılmamış, aynı bar için ikinci emir yok."""
+        if not params.autoTrade:
+            return "ask", None
+        key = f"{sym}|{tf}|{res['side']}"
+        if self._auto_fired.get(key) == res["barTime"]:
+            return "skip", None  # bu bar için otomatik emir zaten denendi (yeniden başlatma koruması)
+        ch = res.get("checks") or {}
+        why = None
+        if cand.confidence < params.autoMinConfidence:
+            why = f"güven %{cand.confidence} < %{params.autoMinConfidence}"
+        elif not (ch.get("ret") and ch.get("rsi") and ch.get("cci")):
+            why = "koşullar tamamlanmadı"
+        elif not ch.get("seq"):
+            why = "sıra kuralı yok (önce band içine kapanış, sonra RSI/CCI onayı)"
+        elif not ch.get("agree"):
+            why = "RSI ve CCI yön onayı yok"
+        if why:
+            log.info("Otomatik giriş yok (%s %s): %s -> onayınıza sunulacak", sym, tf, why)
+            return "ask", None
+        acc = self.engine.account()
+        if not acc.connected or not acc.algo or not acc.tradeAllowed:
+            if time.time() - self._auto_warned > 300:
+                self._auto_warned = time.time()
+                self.voice_q.put({"say": "Dikkat efendim, otomatik işlem açık ama MT5'te işlem izni yok. Sinyali onayınıza sunuyorum."})
+            return "ask", None
+        mine = [p for p in (self.engine.positions() or []) if p.magic == self.engine.magic]
+        if any(p.symbol == sym for p in mine):
+            log.info("Otomatik giriş yok (%s): bu paritede açık JARVIS işlemi var -> onayınıza sunulacak", sym)
+            return "ask", None
+        if len(mine) >= params.autoMaxOpen:
+            log.info("Otomatik giriş yok (%s): açık işlem tavanı %d dolu -> onayınıza sunulacak", sym, params.autoMaxOpen)
+            return "ask", None
+        # Kullanıcının paneldeki "Otomatik İşlem" anahtarı, bu koşullar için verilmiş KALICI onaydır.
+        self._auto_fired[key] = int(res["barTime"])
+        self._save_state()
+        comment = f"JARVIS AUTO {res['side']} {tf}"[:31]
+        r = self.engine.place_order(sym, res["side"], cand.volume, cand.sl, cand.tp, comment=comment,
+                                    approved=True, signal_price=entry)
+        side_tr = "alış" if res["side"] == "BUY" else "satış"
+        if r.ok:
+            note = (f"OTOMATİK · güven %{cand.confidence} · MT5 bilet #{r.ticket} @ {r.price} · SL {cand.sl} TP {cand.tp}"
+                    + (f" · {r.message}" if r.message else ""))
+            log.info("🤖 Otomatik işlem açıldı: %s %s %s %.2f lot -> bilet %s", sym, tf, res["side"], cand.volume, r.ticket)
+            self.voice_q.put({"say": f"{sym} {tf} {side_tr} işlemi otomatik açıldı efendim. Güven yüzde {cand.confidence}. Bilet {r.ticket}."})
+            return "auto", {"status": "executed", "ticket": r.ticket, "price": r.price, "note": note}
+        note = f"OTOMATİK giriş başarısız: {r.message}"
+        log.warning("Otomatik işlem açılamadı: %s %s -> %s", sym, tf, r.message)
+        self.voice_q.put({"say": f"Dikkat efendim, {sym} otomatik {side_tr} emri gönderilemedi. {r.message[:120]}"})
+        return "auto", {"status": "failed", "ticket": None, "price": None, "note": note}
+
+    # ------------------------------------------------------------------ açık işlem yönetimi (breakeven)
+    def manage_positions(self, params: KanalParams) -> list[dict]:
+        """TP yolunun breakEvenPct'si kadar kâr eden JARVIS işlemlerinde SL -> giriş fiyatı. Döner: yapılan değişiklikler."""
+        pct = int(params.breakEvenPct)
+        done: list[dict] = []
+        if pct <= 0:
+            return done
+        for p in (self.engine.positions() or []):
+            if p.magic != self.engine.magic or not p.tp or p.ticket in self._be_done:
+                continue
+            dist = abs(p.tp - p.openPrice)
+            if dist <= 0:
+                continue
+            gain = (p.currentPrice - p.openPrice) if p.side == "BUY" else (p.openPrice - p.currentPrice)
+            if gain / dist < pct / 100.0:
+                continue
+            already = bool(p.sl) and ((p.side == "BUY" and p.sl >= p.openPrice) or (p.side == "SELL" and p.sl <= p.openPrice))
+            if already:
+                self._be_done.add(p.ticket)
+                continue
+            r = self.engine.modify_position(p.ticket, sl=p.openPrice, tp=p.tp)
+            if r.ok:
+                self._be_done.add(p.ticket)
+                done.append({"ticket": p.ticket, "symbol": p.symbol, "sl": p.openPrice})
+                log.info("🛡 Breakeven: %s #%s kâr %%%.0f -> SL girişe çekildi (%s)", p.symbol, p.ticket, 100 * gain / dist, p.openPrice)
+                self.voice_q.put({"say": f"{p.symbol} {'alış' if p.side == 'BUY' else 'satış'} işlemi hedefin yüzde {pct}'ine ulaştı, stop girişe çekildi efendim."})
+            else:
+                log.debug("Breakeven ertelendi #%s: %s", p.ticket, r.message)
+        return done
+
+    def manage_loop(self) -> None:
+        interval = float(self.cfg.get("manage_interval", 3.0))
+        while not self.stop.is_set():
+            try:
+                k = self.kanal
+                if k and k.get("enabled", True):
+                    self.manage_positions(KanalParams.from_dict(k.get("params")))
+            except Exception as e:  # noqa: BLE001
+                log.debug("pozisyon yönetimi hatası: %s", e)
+            time.sleep(interval)
 
     # ------------------------------------------------------------------ piyasa verisi (panel grafiği, RSI/CCI radarı)
     def market_loop(self) -> None:

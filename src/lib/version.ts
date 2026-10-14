@@ -1,6 +1,6 @@
 /** Sürümler. Ajan sürümü public/agent/app.py içindeki AGENT_VERSION ile aynı olmalıdır. */
-export const PANEL_VERSION = "2.8.1";
-export const LATEST_AGENT = "2.8.1";
+export const PANEL_VERSION = "2.9.0";
+export const LATEST_AGENT = "2.9.0";
 
 export function cmpVersion(a: string, b: string) {
   const pa = a.split(".").map(Number), pb = b.split(".").map(Number);
