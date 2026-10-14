@@ -1,0 +1,108 @@
+import type { Candle } from "./indicators";
+
+/**
+ * Canlı (geçici) veri deposu — ajanın gönderdiği mumlar ve ping burada tutulur.
+ * Veritabanına yazılmaz: anlık piyasa verisi kalıcı olmak zorunda değil ve
+ * her saniye DB yazmak gömülü veritabanını gereksiz yorar.
+ */
+export type LiveSeries = { symbol: string; timeframe: string; candles: Candle[]; bid: number | null; ask: number | null; at: number };
+type UserLive = { series: Map<string, LiveSeries>; ping: number | null; pingAt: number };
+
+const g = globalThis as typeof globalThis & {
+  __jarvisScan?: Map<number, { at: number; items: unknown[]; watch: string[] }>;
+  __jarvisLive?: Map<number, UserLive>;
+  __jarvisDemoPx?: Map<number, number>;
+};
+
+function user(userId: number): UserLive {
+  g.__jarvisLive ??= new Map();
+  let u = g.__jarvisLive.get(userId);
+  if (!u) {
+    u = { series: new Map(), ping: null, pingAt: 0 };
+    g.__jarvisLive.set(userId, u);
+  }
+  return u;
+}
+
+const key = (symbol: string, tf: string) => `${symbol.toUpperCase()}|${tf}`;
+
+export function putSeries(userId: number, s: Omit<LiveSeries, "at">) {
+  user(userId).series.set(key(s.symbol, s.timeframe), { ...s, at: Date.now() });
+}
+
+export function getSeries(userId: number, symbol: string, tf: string, maxAgeMs = 180000): LiveSeries | undefined {
+  const s = user(userId).series.get(key(symbol, tf));
+  return s && Date.now() - s.at < maxAgeMs ? s : undefined;
+}
+
+export function setPing(userId: number, ping: number | null) {
+  const u = user(userId);
+  u.ping = ping;
+  u.pingAt = Date.now();
+}
+
+export function getPing(userId: number): number | null {
+  const u = user(userId);
+  return Date.now() - u.pingAt < 30000 ? u.ping : null;
+}
+
+/** Demo modunda açık işlem fiyatlarını bellekte oynatır (DB'ye yazmadan). */
+export function demoPrice(tradeId: number, base: number, step: number): number {
+  g.__jarvisDemoPx ??= new Map();
+  const cur = g.__jarvisDemoPx.get(tradeId) ?? base;
+  const next = Math.round((cur + (Math.random() - 0.48) * step * 6) / (step / 10)) * (step / 10);
+  g.__jarvisDemoPx.set(tradeId, next);
+  return next;
+}
+
+/** Ajanın KANAL taraması (Piyasa Gözlemi'ndeki tüm pariteler). */
+export function putScan(userId: number, items: unknown[], watch: string[]) {
+  g.__jarvisScan ??= new Map();
+  g.__jarvisScan.set(userId, { at: Date.now(), items, watch });
+}
+export function getScan(userId: number, maxAgeMs = 90000) {
+  const s = g.__jarvisScan?.get(userId);
+  return s && Date.now() - s.at < maxAgeMs ? s : undefined;
+}
+
+/* ------------------------------------------------------------------ canlı fiyat akışı (ajan -> panel, ~1 sn) */
+export type Tick = {
+  s: string; bid: number; ask: number; t: number; stale: number;
+  digits?: number; point?: number; stops?: number; minLot?: number; lotStep?: number; at: number;
+};
+const gt = globalThis as typeof globalThis & {
+  __jarvisTicks?: Map<number, Map<string, Tick>>;
+  __jarvisAgent?: Map<number, AgentInfo>;
+};
+
+export function putTicks(userId: number, ticks: Omit<Tick, "at">[]) {
+  gt.__jarvisTicks ??= new Map();
+  let m = gt.__jarvisTicks.get(userId);
+  if (!m) gt.__jarvisTicks.set(userId, (m = new Map()));
+  const now = Date.now();
+  for (const t of ticks) if (t && typeof t.s === "string" && Number.isFinite(t.bid) && Number.isFinite(t.ask)) m.set(t.s.toUpperCase(), { ...t, at: now });
+}
+export function getTick(userId: number, symbol: string, maxAgeMs = 15000): Tick | undefined {
+  const t = gt.__jarvisTicks?.get(userId)?.get(symbol.toUpperCase());
+  return t && Date.now() - t.at < maxAgeMs ? t : undefined;
+}
+export function allTicks(userId: number, maxAgeMs = 15000): Tick[] {
+  const m = gt.__jarvisTicks?.get(userId);
+  if (!m) return [];
+  const now = Date.now();
+  return [...m.values()].filter((t) => now - t.at < maxAgeMs);
+}
+
+/** Ajanın bildirdiği durum (sürüm, Algo Trading, veri akışı hataları). */
+export type AgentInfo = {
+  version: string; algo: boolean; tradeAllowed: boolean; build: number; at: number;
+  feedErrors: [string, string][]; feedOk: number;
+};
+export function setAgentInfo(userId: number, p: Partial<AgentInfo>) {
+  gt.__jarvisAgent ??= new Map();
+  const cur = gt.__jarvisAgent.get(userId) ?? { version: "", algo: true, tradeAllowed: true, build: 0, at: 0, feedErrors: [], feedOk: 0 };
+  gt.__jarvisAgent.set(userId, { ...cur, ...p, at: Date.now() });
+}
+export function getAgentInfo(userId: number): AgentInfo | undefined {
+  return gt.__jarvisAgent?.get(userId);
+}

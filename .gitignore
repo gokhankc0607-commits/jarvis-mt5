@@ -1,0 +1,32 @@
+# Panel verileri ve yerel ayarlar
+data/
+.env.local
+.env*.local
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+next-env.d.ts
+npm-debug.log*
+
+# Python ajanı (public/agent)
+__pycache__/
+*.pyc
+.venv/
+venv/
+public/agent/build/
+public/agent/dist/
+public/agent/logs/
+public/agent/models/
+public/agent/voices/
+public/agent/config.json
+public/agent/.jarvis_state.json
+public/agent/.update_backup/
+
+# Editör / işletim sistemi
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
