@@ -6,6 +6,7 @@ export type Signal = {
 export type Trade = {
   id: number; ticket: string; symbol: string; side: "BUY" | "SELL"; volume: number; openPrice: number; currentPrice: number;
   sl: number | null; tp: number | null; pnl: number; status: string; source: string; comment: string; openedAt: string; closedAt: string | null;
+  timeframe?: string;
 };
 export type Strategy = {
   id: number; name: string; filePath: string; description: string; code: string; version: number; status: string;
@@ -38,6 +39,7 @@ export type StateT = {
     feedErrors: [string, string][]; feedOk: number; tickAge: number | null; ticks: number;
   };
   failedSignals: { id: number; symbol: string; side: string; note: string; createdAt: string }[];
+  telegram?: { enabled: boolean; quiet: boolean };
   perf: { weekPnl: number; monthPnl: number; yearPnl: number; week: number; month: number; year: number; winRate: number; closed: number };
 };
 
@@ -50,4 +52,4 @@ export type RadarRowT = {
   symbol: string; tf: string; price: number | null; rsi: number | null; cci: number | null; signal: "BUY" | "SELL" | null;
   strength: number; tags: string[]; rsiZone: "os" | "ob" | null; cciZone: "os" | "ob" | null; cfg: { os: number; ob: number; cci: number };
 };
-export type MarketT = { live: boolean; quotes: QuoteT[]; radar: RadarRowT[] };
+export type MarketT = { live: boolean; quotes: QuoteT[]; radar: RadarRowT[]; tf: string | null };

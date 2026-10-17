@@ -9,10 +9,7 @@ export function normalizeTr(s: string) {
 /** Cümlede olumsuzluk / vazgeçme var mı? ("evet ama girme", "evet, hayır demek istedim" → onay DEĞİL) */
 const NEGATION = /\b(hayır|hayir|değil|degil|yok|girme|iptal)\b/;
 
-/**
- * Kesin onay: yalnızca açık "evet" ifadeleri işlem onayı sayılır.
- * Ajandaki local_ai.is_yes ile AYNI kural: olumsuzluk içeren bir cümle hiçbir zaman onay sayılmaz.
- */
+/** Kesin onay: yalnızca açık "evet" ifadeleri işlem onayı sayılır. */
 export function isYes(s: string) {
   const t = normalizeTr(s);
   if (!t || NEGATION.test(t)) return false;

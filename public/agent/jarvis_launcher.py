@@ -84,10 +84,17 @@ def load_cfg() -> dict:
     return json.loads(json.dumps(DEFAULT))
 
 
+KEY_RE = re.compile(r"^jrv_[a-f0-9]{48}$")
+
+
+def valid_key(k: str) -> bool:
+    return bool(KEY_RE.match((k or "").strip()))
+
+
 def cfg_complete(c: dict) -> bool:
     return bool(
         c.get("dashboard_url")
-        and c.get("agent_key", "").startswith("jrv_")
+        and valid_key(c.get("agent_key", ""))
         and os.path.isfile(c.get("metaeditor_path") or "")
         and os.path.isdir(c.get("mql5_dir") or "")
     )
@@ -271,7 +278,8 @@ def run_wizard(cfg: dict) -> bool:
 
     def save_start() -> None:
         c = collect()
-        if not c["agent_key"].startswith("jrv_"):
+        c["agent_key"] = c["agent_key"].strip()
+        if not valid_key(c["agent_key"]):
             messagebox.showerror("JARVIS", "Geçerli bir ajan anahtarı girin (paneldeki Yerel Ajan sayfası).")
             return
         CONFIG.write_text(json.dumps(c, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -297,6 +305,34 @@ def _is_local(url: str) -> bool:
 SAFE_FILE = re.compile(r"^(?:[\w-]+\.py|mql5/[\w.-]+\.mq5|requirements(?:-voice)?\.txt|config\.example\.json|README\.md)$")
 
 
+def check_panel(cfg: dict) -> tuple[str, str]:
+    """Panel ve ajan anahtarı ön kontrolü: ok | badkey | down | old | error."""
+    import requests
+
+    url = str(cfg.get("dashboard_url", "")).rstrip("/")
+    if not url:
+        return "error", "Panel URL boş"
+    try:
+        r = requests.get(f"{url}/api/agent/manifest", headers={"x-agent-key": cfg.get("agent_key", "")}, timeout=6)
+    except Exception as e:  # noqa: BLE001
+        return "down", type(e).__name__
+    if r.status_code == 401:
+        return "badkey", ""
+    if r.status_code == 404:
+        return "old", ""
+    if not r.ok:
+        return "error", f"HTTP {r.status_code}"
+    return "ok", ""
+
+
+def box(lines: list[str]) -> None:
+    w = max(len(x) for x in lines) + 4
+    print("\n " + "=" * w)
+    for x in lines:
+        print("   " + x)
+    print(" " + "=" * w + "\n")
+
+
 def self_update(cfg: dict) -> bool:
     """Kaynak koddan çalışırken panelden yeni sürümü indirir (yalnızca .py/.mq5/requirements — config.json ve .bat'lara ASLA dokunmaz).
     Varsayılan: yalnızca yerel ağ adreslerinde (localhost / 192.168.x.x) açık. EXE (frozen) kendini güncelleyemez."""
@@ -309,7 +345,15 @@ def self_update(cfg: dict) -> bool:
 
     hdr = {"x-agent-key": cfg.get("agent_key", "")}
     try:
-        m = requests.get(f"{url}/api/agent/manifest", headers=hdr, timeout=6).json()
+        r = requests.get(f"{url}/api/agent/manifest", headers=hdr, timeout=6)
+        if r.status_code == 401:
+            print("[güncelleme] atlandı: ajan anahtarı panel tarafından reddedildi (401)")
+            return False
+        if r.status_code == 404:
+            print("[güncelleme] atlandı: panel eski sürüm (otomatik güncelleme desteklemiyor) — paneli güncelleyin")
+            return False
+        r.raise_for_status()
+        m = r.json()
         files = m["files"]
     except Exception as e:  # noqa: BLE001
         print(f"[güncelleme] panele ulaşılamadı, atlanıyor ({type(e).__name__})")
@@ -389,6 +433,28 @@ def main() -> None:
         if not run_wizard(cfg):
             print("Kurulum iptal edildi.")
             return
+        cfg = autofill(load_cfg())
+
+    # Ön kontrol: panel açık mı, anahtar geçerli mi?
+    st, detail = check_panel(cfg)
+    if st == "badkey":
+        box([
+            "AJAN ANAHTARI GEÇERSİZ — panel bu anahtarı tanımıyor (401).",
+            "Neden: panel yeni bir klasöre kurulduysa veritabanı (ve anahtar) yenilenir.",
+            "Çözüm: Panel > Yerel Ajan sayfasındaki 'Ajan Anahtarı'nı kopyalayın.",
+            "Kurulum penceresi şimdi açılıyor — anahtarı yapıştırıp 'Kaydet ve Başlat'.",
+        ])
+        if not run_wizard(cfg):
+            print("Kurulum iptal edildi.")
+            return
+        cfg = autofill(load_cfg())
+    elif st == "down":
+        box([
+            f"PANELE ULAŞILAMADI: {cfg.get('dashboard_url')}  ({detail})",
+            "Panel penceresi (PANEL_BASLAT.bat) açık mı? Ajan bağlanmayı denemeye devam edecek.",
+        ])
+    elif st == "old":
+        print("[uyarı] Panel eski sürüm görünüyor — paneli de güncelleyin (PANEL_BASLAT.bat yeniden derler).")
     if "--no-update" in args:
         args = [a for a in args if a != "--no-update"]
     elif self_update(cfg):

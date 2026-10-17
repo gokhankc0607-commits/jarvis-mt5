@@ -17,6 +17,10 @@ export async function decideSignal(userId: number, signalId: number, approve: bo
     .where(and(eq(signals.id, signalId), eq(signals.userId, userId)))
     .limit(1);
   if (!s) throw new Error("Sinyal bulunamadı");
+  if (approve && s.status === "pending" && s.source === "manual" && s.timeframe === "MAN" && Date.now() - new Date(s.createdAt).getTime() > 5 * 60000) {
+    await db.update(signals).set({ status: "expired", note: "Onay süresi doldu (5 dk)" }).where(eq(signals.id, s.id));
+    throw new Error("Bu emrin onay süresi doldu (5 dk, fiyat değişti). Komutu tekrar verin.");
+  }
   const retry = approve && s.status === "failed";
   if (s.status !== "pending" && !retry) return s;
   const online = await isAgentOnline(userId);
@@ -57,7 +61,8 @@ export async function decideSignal(userId: number, signalId: number, approve: bo
     tp: s.tp,
     pnl: 0,
     source: "demo",
-    comment: `JARVIS ${s.side} (demo)`,
+    timeframe: s.timeframe,
+    comment: `JARVIS ${s.side} ${s.timeframe} (demo)`,
   });
   const [r] = await db
     .update(signals)

@@ -120,7 +120,7 @@ export default function SignalsView() {
                     <Badge tone="slate">{s.timeframe}</Badge>
                     {s.source === "demo" && <Badge tone="amber">demo</Badge>}
                     {s.source === "manual" && <Badge tone="violet">elle</Badge>}
-                    {(s.note ?? "").startsWith("OTOMATİK") && <Badge tone="amber">⚡ otomatik</Badge>}
+                    {s.source === "auto" && <Badge tone="amber">🤖 oto</Badge>}
                   </div>
                   <div className="text-xs text-slate-500">{timeAgo(s.createdAt)}</div>
                 </div>

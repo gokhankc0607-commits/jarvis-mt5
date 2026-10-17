@@ -19,7 +19,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-from datetime import datetime, timezone
 import queue
 import sys
 import threading
@@ -32,44 +31,13 @@ import requests
 
 from local_ai import JarvisBrain, LLMClient, SpeechToText, TextToSpeech, has_wake_word, is_no, is_yes
 from mql5_compiler import MQL5Compiler
-from kanal_strategy import KanalParams, kanal_analyze, levels_from_result
-from mt5_engine import ALGO_HINT, TIMEFRAMES, MT5Engine, SignalCandidate, WatchRule
+from kanal_strategy import KANAL_TFS, KanalParams, kanal_analyze, kanal_confidence, kanal_levels
+from mt5_engine import ALGO_HINT, TIMEFRAMES, MT5Engine, SignalCandidate, WatchRule, parse_tf
 
 log = logging.getLogger("jarvis")
-AGENT_VERSION = "2.9.0"
+AGENT_VERSION = "3.3.0"
 # PyInstaller ile paketlendiğinde config / modeller .exe'nin yanındaki klasörden okunur
 ROOT = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
-
-
-STATE_FILE = ROOT / ".jarvis_state.json"   # gönderilmiş sinyal kimlikleri (yeniden başlatmada ikinci emir açılmasın)
-APPROVAL_MAX_AGE_SEC = 15 * 60             # bu süreden eski onaylar güvenlik için yürütülmez
-
-
-def load_state() -> dict:
-    try:
-        d = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        return d if isinstance(d, dict) else {}
-    except Exception:  # noqa: BLE001
-        return {}
-
-
-def save_state(d: dict) -> None:
-    try:
-        tmp = STATE_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(d), encoding="utf-8")
-        tmp.replace(STATE_FILE)
-    except Exception as e:  # noqa: BLE001
-        log.debug("durum dosyası yazılamadı: %s", e)
-
-
-def parse_iso(v: Any) -> Optional[datetime]:
-    """Panelden gelen ISO zaman damgası (örn. 2026-10-14T20:40:00.000Z) -> aware datetime."""
-    if not v:
-        return None
-    try:
-        return datetime.fromisoformat(str(v).replace("Z", "+00:00"))
-    except ValueError:
-        return None
 
 
 def rel(p: Optional[str]) -> Optional[str]:
@@ -92,6 +60,19 @@ class Dashboard:
 
     def sync(self, payload: dict) -> dict:
         r = self.s.post(f"{self.url}/api/agent/sync", data=json.dumps(payload, default=str), timeout=15)
+        r.raise_for_status()
+        return r.json()
+
+    def telegram(self, data: str, callback_query_id: str = "") -> dict:
+        """Telegram düğmesi -> panel (onay / ret / sessiz)."""
+        r = self.s.post(f"{self.url}/api/agent/telegram",
+                        data=json.dumps({"data": data, "callbackQueryId": callback_query_id}), timeout=30)
+        r.raise_for_status()
+        return r.json()
+
+    def command(self, text: str) -> dict:
+        """Sesli komutu paneldeki aynı komut işleyiciye gönderir (emir aç / SL-TP / kapat / durum / sohbet)."""
+        r = self.s.post(f"{self.url}/api/agent/command", data=json.dumps({"text": text}), timeout=40)
         r.raise_for_status()
         return r.json()
 
@@ -141,17 +122,20 @@ class Jarvis:
         self.pos_miss: dict[str, int] = {}
         self.closed_buf: list[dict] = []
         self._algo_warn = 0.0
+        self.auto_magic = int(self.engine.magic) + 1   # otomatik işlemler ayrı magic ile açılır (ayırt etmek için)
+        self.be_state: dict[str, tuple[int, float]] = {}  # bilet -> (deneme, son deneme zamanı)
+        self.pt_state: dict[str, tuple[int, float]] = {}  # yarı kâr: bilet -> (deneme, zaman)
+        self.pt_done: set[str] = set()
+        self.pt_checked: set[str] = set()
+        self._mw_sent = 0.0
+        self.tg_offset = 0
+        self.tg_errors = 0
+        self.tf_map: dict[str, str] = self._load_tf_map()  # pozisyon bileti -> açıldığı zaman dilimi (kalıcı)
+        self.last_positions: list = []
         self.outbox: list[dict] = []
         self.asked: set[int] = set()
-        st = load_state()
-        self.executed: set[int] = {int(x) for x in st.get("executed", []) if str(x).isdigit()}
-        # Otomatik açılan işlemler: "SEMBOL|TF|YÖN" -> bar zamanı (yeniden başlatmada aynı bar için ikinci emir açılmasın)
-        self._auto_fired: dict[str, int] = {str(k): int(v) for k, v in (st.get("autoFired") or {}).items() if str(v).lstrip("-").isdigit()}
-        self._be_done: set[int] = set()        # SL'si girişe çekilmiş biletler (tekrar denenmesin)
-        self._auto_warned = 0.0
-        if self.executed or self._auto_fired:
-            log.info("Önceki oturumdan %d gönderilmiş sinyal, %d otomatik işlem anahtarı yüklendi (mükerrer emir koruması)",
-                     len(self.executed), len(self._auto_fired))
+        self.executed: set[int] = set()
+        self.done_cmds: set[int] = set()
         self.compile_q: "queue.Queue[dict]" = queue.Queue()
         self.voice_q: "queue.Queue[dict]" = queue.Queue()
         self.lock = threading.Lock()
@@ -162,6 +146,39 @@ class Jarvis:
         self.busy_voice = threading.Event()
         self.stop = threading.Event()
 
+    # ------------------------------------------------------------------ zaman dilimi kaydı
+    TF_FILE = "tf_map.json"
+
+    def _load_tf_map(self) -> dict:
+        try:
+            return {str(k): str(v) for k, v in json.loads((ROOT / self.TF_FILE).read_text(encoding="utf-8")).items()}
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def remember_tf(self, tf: str, *tickets: Any) -> None:
+        """Ajanın açtığı her pozisyonun zaman dilimini kalıcı olarak kaydeder (broker yorumu silse bile bilinir)."""
+        tf = (tf or "").upper()
+        if not tf:
+            return
+        changed = False
+        for t in tickets:
+            if t:
+                self.tf_map[str(t)] = tf
+                changed = True
+        if changed:
+            if len(self.tf_map) > 2000:  # en eski kayıtları at
+                self.tf_map = dict(list(self.tf_map.items())[-1500:])
+            try:
+                (ROOT / self.TF_FILE).write_text(json.dumps(self.tf_map), encoding="utf-8")
+            except Exception as e:  # noqa: BLE001
+                log.debug("tf_map yazılamadı: %s", e)
+
+    def tf_of(self, p: Any) -> str:
+        tf = self.tf_map.get(str(p.ticket)) or parse_tf(getattr(p, "comment", ""))
+        if tf and str(p.ticket) not in self.tf_map:
+            self.remember_tf(tf, p.ticket)
+        return tf
+
     # ------------------------------------------------------------------ yardımcı
     @property
     def llm(self) -> Optional[LLMClient]:
@@ -170,14 +187,6 @@ class Jarvis:
 
     def _set_level(self, v: float) -> None:
         self.level = v
-
-    def _save_state(self) -> None:
-        recent = dict(sorted(self._auto_fired.items(), key=lambda kv: kv[1])[-200:])
-        save_state({"executed": sorted(self.executed)[-500:], "autoFired": recent})
-
-    def _mark_executed(self, sid: int) -> None:
-        self.executed.add(sid)
-        self._save_state()
 
     def speak(self, text: str) -> None:
         if self.tts:
@@ -207,7 +216,7 @@ class Jarvis:
         threading.Thread(target=self.scan_loop, daemon=True, name="scan").start()
         threading.Thread(target=self.market_loop, daemon=True, name="market").start()
         threading.Thread(target=self.quote_loop, daemon=True, name="quotes").start()
-        threading.Thread(target=self.manage_loop, daemon=True, name="manage").start()
+        threading.Thread(target=self.telegram_loop, daemon=True, name="telegram").start()
         log.info("JARVIS ajan v%s başlatıldı", AGENT_VERSION)
         threading.Thread(target=self.compile_worker, daemon=True, name="compile").start()
         if self.voice_enabled:
@@ -227,13 +236,13 @@ class Jarvis:
     def sync_loop(self) -> None:
         interval = self.cfg.get("sync_interval", 2.0)
         while not self.stop.is_set():
-            out: list[dict] = []
             try:
                 acc = self.engine.account()
-                pos_objs = self.engine.positions(strict=True) if acc.connected else []
-                # None = MT5 API geçici hata: panele pozisyon listesi gönderme (açık işlemler 'kapandı' sayılmasın)
-                positions = [p.to_dict() for p in pos_objs] if pos_objs is not None else None
-                if acc.connected and pos_objs is not None:
+                pos_objs = self.engine.positions() if acc.connected else []
+                for p in pos_objs:
+                    p.tf = self.tf_of(p)
+                positions = [p.to_dict() for p in pos_objs]
+                if acc.connected:
                     cur = {str(p.ticket) for p in pos_objs}
                     for tk in list(self.known_pos):  # kapanan pozisyonların gerçek K/Z'sini al
                         if tk in cur:
@@ -247,6 +256,11 @@ class Jarvis:
                             self.pos_miss.pop(tk, None)
                     for p in pos_objs:
                         self.known_pos[str(p.ticket)] = p.to_dict()
+                    self.last_positions = pos_objs
+                    try:
+                        self.manage_profit(pos_objs)
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("Kâr yönetimi hatası: %s", e)
                     if not acc.algo and time.time() - self._algo_warn > 300:
                         self._algo_warn = time.time()
                         log.warning("⚠ %s", ALGO_HINT)
@@ -257,21 +271,24 @@ class Jarvis:
                            "agent": {"version": AGENT_VERSION, "algo": acc.algo, "tradeAllowed": acc.tradeAllowed, "build": acc.build}}
                 resp = self.dash.sync(payload)
                 self.closed_buf = []
-                out = []
                 self.handle_sync(resp)
             except requests.RequestException as e:
-                log.warning("Panel erişilemedi: %s", e)
+                code = getattr(getattr(e, "response", None), "status_code", None)
+                if code == 401:
+                    log.error("Ajan anahtarı GEÇERSİZ (401). Paneldeki Yerel Ajan sayfasındaki anahtarı kullanın: "
+                              "CALISTIR.bat --setup  (ya da config.json → agent_key)")
+                    time.sleep(10)
+                else:
+                    log.warning("Panel erişilemedi: %s", e)
             except Exception as e:  # noqa: BLE001
                 log.exception("sync hatası: %s", e)
-            if out:  # gönderilemeyen sinyaller (özellikle otomatik işlem kayıtları) bir sonraki turda tekrar denensin
-                with self.lock:
-                    self.outbox = out + self.outbox
             time.sleep(interval)
 
     def handle_sync(self, resp: dict) -> None:
         self.rules = [WatchRule.from_dict(r) for r in resp.get("rules", [])]
         self.watch = resp.get("watchlist", [])
         self.kanal = resp.get("kanal") or {}
+        self.telegram_cfg = resp.get("telegram") or {}
         prov = resp.get("provider")
         if prov:
             self.remote_llm = LLMClient.from_dict(prov)
@@ -282,40 +299,43 @@ class Jarvis:
         for s in resp.get("approvedSignals", []):
             if s["id"] in self.executed or s.get("status") != "approved":
                 continue
-            comment = f"JARVIS {s['side']} #{s['id']}"
-            # Güvenlik 1: eski onay (ajan kapalıyken verilmiş) yürütülmez — fiyat/SL/TP bayattır
-            dt = parse_iso(s.get("decidedAt"))
-            age = (datetime.now(timezone.utc) - dt).total_seconds() if dt else 0.0
-            if age > APPROVAL_MAX_AGE_SEC:
-                self._mark_executed(s["id"])
-                self.dash.report({"type": "signal", "id": s["id"], "status": "failed",
-                                  "note": f"Onay {int(age // 60)} dk önce verilmiş — güvenlik için gönderilmedi. Fiyat güncelse 'Tekrar dene'."})
-                continue
-            # Güvenlik 2: aynı sinyal için MT5'te zaten pozisyon/işlem varsa (rapor ulaşmamış, ajan yeniden başlamış) tekrar açma
-            dup = self.engine.find_by_comment(comment)
-            if dup is not None:
-                log.warning("Sinyal #%s için MT5'te zaten işlem var (bilet %s) — tekrar gönderilmedi", s["id"], dup)
-                self._mark_executed(s["id"])
-                self.dash.report({"type": "signal", "id": s["id"], "status": "executed",
-                                  "note": f"MT5 bilet #{dup} (daha önce gönderilmişti; mükerrer emir engellendi)"})
-                continue
-            self._mark_executed(s["id"])
+            self.executed.add(s["id"])
             r = self.engine.place_order(s["symbol"], s["side"], s["volume"], s.get("sl"), s.get("tp"),
-                                        comment=comment, approved=True, signal_price=s.get("price"))
+                                        comment=f"JARVIS {s['side']} {s.get('timeframe') or ''} #{s['id']}".replace("  ", " "), approved=True,
+                                        signal_price=s.get("price"))
             if r.ok:
+                self.remember_tf(s.get("timeframe") or "", r.position, r.ticket)
                 log.info("✓ Emir gerçekleşti: %s %s %s lot — %s", s["symbol"], s["side"], s["volume"], r.message)
-                self.dash.report({"type": "signal", "id": s["id"], "status": "executed",
-                                  "note": f"MT5 bilet #{r.ticket} @ {r.price} · {r.message}"[:480]})
+                self.dash.report({"type": "signal", "id": s["id"], "status": "executed", "ticket": str(r.position or r.ticket),
+                                  "note": f"MT5 bilet #{r.position or r.ticket} @ {r.price} · {r.message}"[:480]})
                 self.voice_q.put({"say": f"{s['symbol']} {s['side']} emri gerçekleşti efendim. Bilet {r.ticket}."})
             else:
                 log.error("✗ Emir reddedildi: %s %s — %s", s["symbol"], s["side"], r.message)
                 self.executed.discard(s["id"])  # panelden "Tekrar dene" ile yeniden gönderilebilsin
-                self._save_state()
                 self.dash.report({"type": "signal", "id": s["id"], "status": "failed", "note": r.message[:480]})
                 short = "MT5'te Algo Trading kapalı. Üstteki Algo Trading düğmesini açın." if r.retcode == 10027 else r.message[:160]
                 self.voice_q.put({"say": f"Dikkat efendim, {s['symbol']} emri gönderilemedi. {short}"})
 
-        # 2) Kapatma istekleri
+        # 2a) SL/TP değiştirme ve kapatma komutları (panel / sohbet / sesli)
+        for c in resp.get("commands", []):
+            if c["id"] in self.done_cmds:
+                continue
+            self.done_cmds.add(c["id"])
+            if c.get("type") == "modify":
+                r = self.engine.modify_position(int(c["ticket"]), c.get("sl"), c.get("tp"))
+            elif c.get("type") == "close":
+                r = self.engine.close_position(int(c["ticket"]))
+            elif c.get("type") == "partial":
+                r = self.engine.close_partial(int(c["ticket"]), float(c.get("fraction") or 0.5))
+                if r.ok:
+                    self.pt_done.add(str(c["ticket"]))
+            else:
+                continue
+            (log.info if r.ok else log.error)("%s %s #%s -> %s", "✓" if r.ok else "✗", c.get("type"), c.get("ticket"), r.message)
+            self.dash.report({"type": "command", "id": c["id"], "status": "done" if r.ok else "failed",
+                              "note": (r.message or "")[:480], "sl": c.get("sl"), "tp": c.get("tp")})
+
+        # 2) Kapatma istekleri (eski panel uyumluluğu)
         for t in resp.get("closeTickets", []):
             r = self.engine.close_position(int(t))
             log.info("Kapatma #%s -> %s %s", t, r.ok, r.message)
@@ -326,6 +346,8 @@ class Jarvis:
 
         # 4) Bekleyen sinyaller -> sesli sor
         for s in resp.get("pendingSignals", []):
+            if s.get("source") == "manual":  # elle verilen emirlerin onayı panel / sohbette sorulur
+                continue
             if s["id"] not in self.asked:
                 self.asked.add(s["id"])
                 self.voice_q.put({"ask": s})
@@ -355,13 +377,14 @@ class Jarvis:
     def kanal_scan(self, k: dict) -> None:
         """KANAL3BAND geri dönüş + RSI + CCI(MA) stratejisi — Piyasa Gözlemi'ndeki TÜM pariteler."""
         params = KanalParams.from_dict(k.get("params"))
-        tfs = [t.strip() for t in str(k.get("timeframes", "M15,H1")).split(",") if t.strip() in TIMEFRAMES]
+        tfs = [t.strip() for t in str(k.get("timeframes", "M15,H1")).split(",") if t.strip() in KANAL_TFS and t.strip() in TIMEFRAMES]
         if not tfs:
             return
-        if k.get("scanAll", True):
+        mode = k.get("scanMode") or ("marketwatch" if k.get("scanAll") else "list")
+        if mode == "marketwatch":
             symbols = self.engine.market_watch_symbols()
-        else:
-            symbols = sorted({w["symbol"] for w in self.watch})
+        else:  # takip listem (boşsa izleme kurallarındaki pariteler)
+            symbols = [str(x) for x in (k.get("symbols") or [])] or sorted({r.symbol for r in self.rules})
         lot = float(k.get("lot", 0.1))
         self.scan_symbols = list(symbols)
         items: list[dict] = []
@@ -384,133 +407,175 @@ class Jarvis:
                 if self._fired.get(key) == res["barTime"]:
                     continue  # bu bar için sinyal zaten verildi
                 self._fired[key] = res["barTime"]
-                try:
+                try:  # sinyalin geldiği zaman diliminin o anki bandı + RSI dip/tepesi + GÜNCEL fiyat
                     bid, ask = self.engine.tick(sym)
                     entry = ask if res["side"] == "BUY" else bid
-                    sl, tp = levels_from_result(res, entry, params)   # SL: önceki dip/tepe veya RSI dönüş barı · TP: en yakın karşı band
+                    sl, tp = kanal_levels(res["side"], entry, res["extreme"], res["center"], res["atr"], params)
+                    conf = kanal_confidence(res["side"], res["depth"], res["rsiPeak"], res["cci"], res["cciMa"], entry, sl, tp, params)["score"]
                 except Exception:  # noqa: BLE001
-                    entry, sl, tp = res["entry"], res["sl"], res["tp"]
+                    entry, sl, tp, conf = res["entry"], res["sl"], res["tp"], res.get("confidence", 0)
                 digits = 2 if entry > 1000 else 3 if entry > 50 else 5
-                strength = int(res.get("strength", 1))
-                ch = res.get("checks") or {}
                 cand = SignalCandidate(
                     symbol=sym, side=res["side"], timeframe=tf, price=round(entry, digits), sl=round(sl, digits),
-                    tp=round(tp, digits), volume=lot, reason="KANAL: " + res["reason"],
-                    confidence=int(res.get("confidence", 0)),
+                    tp=round(tp, digits), volume=lot, reason="KANAL: " + res["reason"], confidence=int(conf),
                     indicators={"RSI": round(res["rsi"] or 0, 1), "CCI": round(res["cci"] or 0, 1),
-                                "CCI_MA": round(res["cciMa"] or 0, 1), "Band": params.band, "kırılan band": strength,
-                                "sıra": "✓" if ch.get("seq") else "✗", "yön": "✓" if ch.get("agree") else "✗",
-                                "SL çapası": round(res["anchor"], digits) if res.get("anchor") else 0},
+                                "CCI_MA": round(res["cciMa"] or 0, 1), ("RSI dip" if res["side"] == "BUY" else "RSI tepe"): round(res["rsiPeak"] or 0, 1),
+                                "bant dışı (ATR)": round(res["depth"], 2)},
                 )
-                log.info("⚡ KANAL sinyal: %s %s %s — %s", sym, tf, res["side"], res["reason"])
-                mode, auto = self.try_auto_trade(sym, tf, res, cand, params, entry)
-                if mode == "skip":
-                    continue
-                payload = cand.to_dict()
-                if auto:
-                    payload["auto"] = auto
+                d = cand.to_dict()
+                auto = k.get("auto") or {}
+                if auto.get("enabled") and conf >= int(auto.get("minConf", 80)):
+                    status, note = self.auto_execute(cand, auto)
+                    d.update(auto=True, status=status, note=note)
+                    log.info("🤖 OTOMATİK %s: %s %s %s güven %%%s — %s", status, sym, tf, res["side"], conf, note)
+                    side_tr = "alış" if res["side"] == "BUY" else "satış"
+                    if status == "executed":
+                        self.voice_q.put({"say": f"Efendim, {sym} {tf} {side_tr} işlemine otomatik girdim. Güven yüzde {conf}."})
+                    elif status == "failed":
+                        self.voice_q.put({"say": f"Dikkat efendim, {sym} otomatik {side_tr} emri gönderilemedi. {note[:120]}"})
+                else:
+                    log.info("⚡ KANAL sinyal: %s %s %s güven %%%s — %s", sym, tf, res["side"], conf, res["reason"])
                 with self.lock:
-                    self.outbox.append(payload)
+                    self.outbox.append(d)
         self.dash.market({"scan": items, "watch": symbols})
 
     # ------------------------------------------------------------------ otomatik işlem
-    def try_auto_trade(self, sym: str, tf: str, res: dict, cand: SignalCandidate, params: KanalParams,
-                       entry: float) -> tuple[str, Optional[dict]]:
-        """Otomatik giriş kararı. Döner: ("ask", None) -> normal akış (JARVIS sorar) · ("skip", None) -> hiç gönderme ·
-        ("auto", {...}) -> emir denendi, sonucu panele 'auto' alanıyla bildirilir.
-
-        Kurallar (kullanıcı tanımı): panelde Otomatik İşlem AÇIK, güven ≥ eşik, İLK kural band içine kapanış sağlanmış,
-        RSI ve CCI onayı dönüşten SONRA ve arka arkaya aynı yönde (sıra ✓ · yön ✓). Güvenlik: Algo Trading açık,
-        aynı paritede açık JARVIS işlemi yok, toplam otomatik açık işlem tavanı aşılmamış, aynı bar için ikinci emir yok."""
-        if not params.autoTrade:
-            return "ask", None
-        key = f"{sym}|{tf}|{res['side']}"
-        if self._auto_fired.get(key) == res["barTime"]:
-            return "skip", None  # bu bar için otomatik emir zaten denendi (yeniden başlatma koruması)
-        ch = res.get("checks") or {}
-        why = None
-        if cand.confidence < params.autoMinConfidence:
-            why = f"güven %{cand.confidence} < %{params.autoMinConfidence}"
-        elif not (ch.get("ret") and ch.get("rsi") and ch.get("cci")):
-            why = "koşullar tamamlanmadı"
-        elif not ch.get("seq"):
-            why = "sıra kuralı yok (önce band içine kapanış, sonra RSI/CCI onayı)"
-        elif not ch.get("agree"):
-            why = "RSI ve CCI yön onayı yok"
-        if why:
-            log.info("Otomatik giriş yok (%s %s): %s -> onayınıza sunulacak", sym, tf, why)
-            return "ask", None
-        acc = self.engine.account()
-        if not acc.connected or not acc.algo or not acc.tradeAllowed:
-            if time.time() - self._auto_warned > 300:
-                self._auto_warned = time.time()
-                self.voice_q.put({"say": "Dikkat efendim, otomatik işlem açık ama MT5'te işlem izni yok. Sinyali onayınıza sunuyorum."})
-            return "ask", None
-        mine = [p for p in (self.engine.positions() or []) if p.magic == self.engine.magic]
-        if any(p.symbol == sym for p in mine):
-            log.info("Otomatik giriş yok (%s): bu paritede açık JARVIS işlemi var -> onayınıza sunulacak", sym)
-            return "ask", None
-        if len(mine) >= params.autoMaxOpen:
-            log.info("Otomatik giriş yok (%s): açık işlem tavanı %d dolu -> onayınıza sunulacak", sym, params.autoMaxOpen)
-            return "ask", None
-        # Kullanıcının paneldeki "Otomatik İşlem" anahtarı, bu koşullar için verilmiş KALICI onaydır.
-        self._auto_fired[key] = int(res["barTime"])
-        self._save_state()
-        comment = f"JARVIS AUTO {res['side']} {tf}"[:31]
-        r = self.engine.place_order(sym, res["side"], cand.volume, cand.sl, cand.tp, comment=comment,
-                                    approved=True, signal_price=entry)
-        side_tr = "alış" if res["side"] == "BUY" else "satış"
+    def auto_execute(self, cand: SignalCandidate, auto: dict) -> tuple[str, str]:
+        """Kullanıcının panelde AÇTIĞI otomatik işlem modu: onay sormadan emir gönderir.
+        Güvenlik: aynı sembolde açık pozisyon varsa atlar · en fazla `maxPositions` otomatik pozisyon."""
+        try:
+            positions = self.engine.positions()
+        except Exception as e:  # noqa: BLE001
+            return "failed", f"Pozisyonlar okunamadı: {e}"
+        real = self.engine.resolve_symbol(cand.symbol)
+        if any(p.symbol == real or p.symbol == cand.symbol for p in positions):
+            return "skipped", f"Atlandı: {cand.symbol} üzerinde zaten açık pozisyon var"
+        n_auto = sum(1 for p in positions if p.magic == self.auto_magic)
+        mx = int(auto.get("maxPositions", 3))
+        if n_auto >= mx:
+            return "skipped", f"Atlandı: otomatik pozisyon limiti dolu ({n_auto}/{mx})"
+        r = self.engine.place_order(cand.symbol, cand.side, cand.volume, cand.sl, cand.tp,
+                                    comment=f"JARVIS AUTO {cand.timeframe}", approved=True,  # onay = kullanıcının açtığı oto-mod
+                                    signal_price=cand.price, magic=self.auto_magic)
         if r.ok:
-            note = (f"OTOMATİK · güven %{cand.confidence} · MT5 bilet #{r.ticket} @ {r.price} · SL {cand.sl} TP {cand.tp}"
-                    + (f" · {r.message}" if r.message else ""))
-            log.info("🤖 Otomatik işlem açıldı: %s %s %s %.2f lot -> bilet %s", sym, tf, res["side"], cand.volume, r.ticket)
-            self.voice_q.put({"say": f"{sym} {tf} {side_tr} işlemi otomatik açıldı efendim. Güven yüzde {cand.confidence}. Bilet {r.ticket}."})
-            return "auto", {"status": "executed", "ticket": r.ticket, "price": r.price, "note": note}
-        note = f"OTOMATİK giriş başarısız: {r.message}"
-        log.warning("Otomatik işlem açılamadı: %s %s -> %s", sym, tf, r.message)
-        self.voice_q.put({"say": f"Dikkat efendim, {sym} otomatik {side_tr} emri gönderilemedi. {r.message[:120]}"})
-        return "auto", {"status": "failed", "ticket": None, "price": None, "note": note}
+            self.remember_tf(cand.timeframe, r.position, r.ticket)
+            return "executed", f"OTOMATİK · MT5 bilet #{r.position or r.ticket} @ {r.price} · {r.message}"[:480]
+        return "failed", (r.message or "Emir reddedildi")[:480]
 
-    # ------------------------------------------------------------------ açık işlem yönetimi (breakeven)
-    def manage_positions(self, params: KanalParams) -> list[dict]:
-        """TP yolunun breakEvenPct'si kadar kâr eden JARVIS işlemlerinde SL -> giriş fiyatı. Döner: yapılan değişiklikler."""
-        pct = int(params.breakEvenPct)
-        done: list[dict] = []
-        if pct <= 0:
-            return done
-        for p in (self.engine.positions() or []):
-            if p.magic != self.engine.magic or not p.tp or p.ticket in self._be_done:
+    def manage_profit(self, positions: list) -> None:
+        """Kâr yönetimi (TP yoluna göre):
+           • %beAtPct (varsayılan 30) kâra geçince SL'yi giriş fiyatına çeker
+           • %partialAtPct (varsayılan 50) kâra geçince pozisyonun %partialPct'ini (varsayılan yarısını) kapatır
+           JARVIS'in açtığı işlemlere (sinyal onayı, hızlı emir, otomatik) her zaman; "tüm işlemlerime uygula" açıksa hepsine."""
+        auto = (self.kanal or {}).get("auto") or {}
+        be_pct = float(auto.get("beAtPct", 30))
+        pt_pct = float(auto.get("partialAtPct", 50))
+        pt_frac = float(auto.get("partialPct", 50)) / 100.0
+        if be_pct <= 0 and pt_pct <= 0:
+            return
+        mine = {int(self.engine.magic), int(self.auto_magic)}
+        now = time.time()
+        live = {str(p.ticket) for p in positions}
+        for st in (self.be_state, self.pt_state):
+            for tk in list(st):
+                if tk not in live:
+                    st.pop(tk, None)
+        for p in positions:
+            tk = str(p.ticket)
+            if not auto.get("beAll") and p.magic not in mine:
                 continue
-            dist = abs(p.tp - p.openPrice)
+            if not p.tp or p.tp <= 0:
+                continue
+            buy = p.side == "BUY"
+            dist = (p.tp - p.openPrice) if buy else (p.openPrice - p.tp)
             if dist <= 0:
                 continue
-            gain = (p.currentPrice - p.openPrice) if p.side == "BUY" else (p.openPrice - p.currentPrice)
-            if gain / dist < pct / 100.0:
-                continue
-            already = bool(p.sl) and ((p.side == "BUY" and p.sl >= p.openPrice) or (p.side == "SELL" and p.sl <= p.openPrice))
-            if already:
-                self._be_done.add(p.ticket)
-                continue
-            r = self.engine.modify_position(p.ticket, sl=p.openPrice, tp=p.tp)
-            if r.ok:
-                self._be_done.add(p.ticket)
-                done.append({"ticket": p.ticket, "symbol": p.symbol, "sl": p.openPrice})
-                log.info("🛡 Breakeven: %s #%s kâr %%%.0f -> SL girişe çekildi (%s)", p.symbol, p.ticket, 100 * gain / dist, p.openPrice)
-                self.voice_q.put({"say": f"{p.symbol} {'alış' if p.side == 'BUY' else 'satış'} işlemi hedefin yüzde {pct}'ine ulaştı, stop girişe çekildi efendim."})
-            else:
-                log.debug("Breakeven ertelendi #%s: %s", p.ticket, r.message)
-        return done
+            prog = ((p.currentPrice - p.openPrice) if buy else (p.openPrice - p.currentPrice)) / dist * 100
 
-    def manage_loop(self) -> None:
-        interval = float(self.cfg.get("manage_interval", 3.0))
+            # --- 1) SL girişe
+            at_be = p.sl > 0 and ((p.sl >= p.openPrice) if buy else (p.sl <= p.openPrice))
+            if be_pct > 0 and prog >= be_pct and not at_be:
+                tries, last = self.be_state.get(tk, (0, 0.0))
+                if tries < 5 and now - last >= 20:
+                    r = self.engine.modify_position(int(p.ticket), sl=p.openPrice)
+                    self.be_state[tk] = (tries + 1, now)
+                    if r.ok:
+                        msg = f"{p.symbol} #{p.ticket}: fiyat TP yolunun %{prog:.0f}'ine ulaştı, SL girişe ({p.openPrice}) çekildi."
+                        log.info("🛡 %s", msg)
+                        self.dash.report({"type": "message", "role": "assistant", "content": "🛡 " + msg})
+                        self.voice_q.put({"say": f"{p.symbol} işleminde stop girişe çekildi efendim."})
+                        self.be_state[tk] = (99, now)
+                    else:
+                        log.warning("SL girişe çekilemedi %s #%s: %s", p.symbol, p.ticket, r.message)
+
+            # --- 2) Yarı kâr al
+            if pt_pct > 0 and prog >= pt_pct and tk not in self.pt_done:
+                if tk not in self.pt_checked:  # yeniden başlatma: daha önce kısmi kapandı mı?
+                    self.pt_checked.add(tk)
+                    if self.engine.partial_done(int(p.ticket)):
+                        self.pt_done.add(tk)
+                        continue
+                tries, last = self.pt_state.get(tk, (0, 0.0))
+                if tries >= 3 or now - last < 20:
+                    continue
+                r = self.engine.close_partial(int(p.ticket), pt_frac)
+                self.pt_state[tk] = (tries + 1, now)
+                if r.ok:
+                    self.pt_done.add(tk)
+                    msg = f"{p.symbol} #{p.ticket}: fiyat TP yolunun %{prog:.0f}'ine ulaştı, yarı kâr alındı — {r.message}."
+                    log.info("💰 %s", msg)
+                    self.dash.report({"type": "message", "role": "assistant", "content": "💰 " + msg})
+                    self.voice_q.put({"say": f"{p.symbol} işleminde yarı kâr alındı efendim."})
+                elif r.retcode == 10014:  # lot bölünemiyor -> tekrar deneme
+                    self.pt_done.add(tk)
+                    log.info("Yarı kâr atlandı %s #%s: %s", p.symbol, p.ticket, r.message)
+                else:
+                    log.warning("Yarı kâr alınamadı %s #%s: %s", p.symbol, p.ticket, r.message)
+
+    # geriye dönük uyumluluk
+    manage_breakeven = manage_profit
+
+    # ------------------------------------------------------------------ telegram
+    def telegram_loop(self) -> None:
+        """Paneldeki Telegram ayarı açıksa botun düğmelerini dinler (✅ Evet / ❌ Hayır / 🔕 sessiz).
+        Düğme tıklamalarını panele iletir; işlem kuralları panelde uygulanır (onay = kullanıcının onayı)."""
         while not self.stop.is_set():
             try:
-                k = self.kanal
-                if k and k.get("enabled", True):
-                    self.manage_positions(KanalParams.from_dict(k.get("params")))
+                cfg = self.telegram_cfg or {}
+                if not cfg.get("enabled") or not cfg.get("botToken") or not cfg.get("chatId"):
+                    self.tg_offset = 0
+                    time.sleep(3)
+                    continue
+                res = requests.post(
+                    f"https://api.telegram.org/bot{cfg['botToken']}/getUpdates",
+                    json={"offset": self.tg_offset, "timeout": 25, "allowed_updates": ["callback_query", "message"]},
+                    timeout=40,
+                ).json()
+                if not res.get("ok"):
+                    self.tg_errors += 1
+                    time.sleep(min(30, 5 * self.tg_errors))
+                    continue
+                self.tg_errors = 0
+                for up in res.get("result", []):
+                    self.tg_offset = up["update_id"] + 1
+                    cq = up.get("callback_query")
+                    if not cq:
+                        continue
+                    data = cq.get("data") or ""
+                    # yalnızca bildirimi giden chat'ten gelen düğmelere yanıt ver
+                    if str(cq.get("message", {}).get("chat", {}).get("id")) != str(cfg.get("chatId")):
+                        continue
+                    try:
+                        out = self.dash.telegram(data, cq.get("id"))
+                        log.info("✈ Telegram: %s -> %s", data, out.get("note", out.get("error", "")))
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("Telegram eylemi başarısız (%s): %s", data, e)
+            except requests.RequestException:
+                time.sleep(10)
             except Exception as e:  # noqa: BLE001
-                log.debug("pozisyon yönetimi hatası: %s", e)
-            time.sleep(interval)
+                self.tg_errors += 1
+                log.warning("Telegram dinleyici hatası (%d): %s", self.tg_errors, e)
+                time.sleep(min(60, 10 * self.tg_errors))
 
     # ------------------------------------------------------------------ piyasa verisi (panel grafiği, RSI/CCI radarı)
     def market_loop(self) -> None:
@@ -526,12 +591,22 @@ class Jarvis:
                 except Exception as e:  # noqa: BLE001
                     self.feed_errors[key] = str(e)[:140]
                     log.debug("%s verisi alınamadı: %s", key, e)
-            if series or self.feed_errors:
+            mw = None
+            if time.time() - self._mw_sent > 60:
+                try:
+                    mw = self.engine.market_watch_symbols(limit=500)
+                    self._mw_sent = time.time()
+                except Exception:  # noqa: BLE001
+                    mw = None
+            if series or self.feed_errors or mw:
                 try:
                     ping = self.engine.account().ping
                 except Exception:  # noqa: BLE001
                     ping = 0.0
-                self.dash.market({"series": series, "ping": ping, "feed": {"errors": list(self.feed_errors.items())[:20], "ok": len(series)}})
+                payload = {"series": series, "ping": ping, "feed": {"errors": list(self.feed_errors.items())[:20], "ok": len(series)}}
+                if mw:
+                    payload["mw"] = mw
+                self.dash.market(payload)
             if time.time() - last_log > 60:
                 last_log = time.time()
                 log.info("Veri akışı: %d seri gönderildi, %d hata%s", len(series), len(self.feed_errors),
@@ -607,46 +682,69 @@ class Jarvis:
         self.speak("Onay alamadım. Sinyal panelde onayınızı bekliyor.")
 
     def voice_loop(self) -> None:
+        """Ses döngüsü: hata olursa ÇÖKMEZ — kaydeder, bekler, devam eder. Üst üste 5 hatada dinlemeyi kapatır
+        (onaylar panelden verilir, sesli yanıtlar sürer). Ajanın geri kalanı (MT5, emirler) her durumda çalışır."""
         wake = self.cfg.get("voice", {}).get("wake_word", "jarvis")
+        fails = 0
         while not self.stop.is_set():
             try:
-                task = self.voice_q.get(timeout=0.2)
-                if "ask" in task:
-                    self.ask_signal(task["ask"])
-                elif "say" in task:
-                    self.speak(task["say"])
-                continue
-            except queue.Empty:
-                pass
-            # Uyandırma kelimesi dinleme
-            heard = self.listen(max_seconds=6, start_timeout=3, silence_sec=0.7)
-            if not heard or not has_wake_word(heard, wake):
-                continue
-            cmd = heard.lower().split(wake, 1)[-1].strip(" ,.")
-            if not cmd:
-                self.speak("Buyurun efendim.")
-                cmd = self.listen(max_seconds=10)
-            if cmd:
-                self.handle_command(cmd)
+                try:
+                    task = self.voice_q.get(timeout=0.2)
+                    if "ask" in task:
+                        self.ask_signal(task["ask"])
+                    elif "say" in task:
+                        self.speak(task["say"])
+                    fails = 0
+                    continue
+                except queue.Empty:
+                    pass
+                if not self.stt:
+                    time.sleep(0.3)
+                    continue
+                # Uyandırma kelimesi dinleme
+                heard = self.listen(max_seconds=6, start_timeout=3, silence_sec=0.7)
+                fails = 0
+                if not heard or not has_wake_word(heard, wake):
+                    continue
+                cmd = heard.lower().split(wake, 1)[-1].strip(" ,.")
+                if not cmd:
+                    self.speak("Buyurun efendim.")
+                    cmd = self.listen(max_seconds=10)
+                if cmd:
+                    self.handle_command(cmd)
+            except Exception as e:  # noqa: BLE001
+                fails += 1
+                log.error("Ses döngüsü hatası (%d/5): %s", fails, e)
+                if fails >= 5 and self.stt is not None:
+                    self.stt = None
+                    log.error("Mikrofon / ses tanıma devre dışı bırakıldı. Onayları panelden verin; sesli yanıtlar devam eder. "
+                              "(Sessiz başlatmak için: CALISTIR.bat --no-voice)")
+                    try:
+                        self.speak("Ses tanımada sorun var efendim. Onayları panelden verebilirsiniz.")
+                    except Exception:  # noqa: BLE001
+                        pass
+                time.sleep(min(10, 2 * fails))
 
     def handle_command(self, cmd: str) -> None:
-        self.dash.report({"type": "message", "role": "user", "content": f"🎙 {cmd}"})
-        c = cmd.lower()
-        if c.startswith(("durum", "bakiye", "hesap")):
-            a = self.engine.account()
-            pos = self.engine.positions()
-            reply = (f"Bakiye {a.balance:.2f}, varlık {a.equity:.2f}, serbest teminat {a.freeMargin:.2f} {a.currency}. "
-                     f"{len(pos)} açık işlem, toplam {sum(p.pnl for p in pos):.2f} kâr zarar.")
-        elif c.startswith("derle"):
-            reply = "Derleme komutunu panelden veya 'derle strateji adı' ile verebilirsiniz; işi kuyruğa alması için komuta merkezini kullanıyorum."
-        elif self.brain:
-            a = self.engine.account()
-            ctx = f"bakiye {a.balance}, varlık {a.equity}, izlenen: {', '.join(r.symbol for r in self.rules)}"
-            reply = self.brain.ask(cmd, ctx)
-        else:
-            reply = "Yerel LLM yapılandırılmadı efendim."
-        self.dash.report({"type": "message", "role": "assistant", "content": reply})
-        self.speak(reply)
+        """Sesli komut -> paneldeki komut işleyici. Emir/kapatma onayı gerekiyorsa sesli 'Evet' beklenir."""
+        try:
+            out = self.dash.command(cmd)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Panel komutu işleyemedi (%s) — yerel yanıt", e)
+            if self.brain:
+                self.speak(self.brain.ask(cmd))
+            else:
+                self.speak("Panele ulaşamıyorum efendim.")
+            return
+        self.speak(out.get("reply", ""))
+        if out.get("action") in ("order_pending", "confirm_close_all"):
+            ans = self.listen(max_seconds=5, start_timeout=7)
+            if is_yes(ans):
+                self.speak(self.dash.command("evet").get("reply", ""))
+            elif is_no(ans):
+                self.speak(self.dash.command("hayır").get("reply", ""))
+            else:
+                self.speak("Onay alamadım efendim. Emir gönderilmedi; panelden onaylayabilirsiniz.")
 
 
 # --------------------------------------------------------------------------- #

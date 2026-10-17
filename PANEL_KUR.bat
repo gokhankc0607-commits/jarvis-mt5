@@ -9,7 +9,7 @@ echo     J A R V I S   K O M U T A   M E R K E Z I  -  KURULUM
 echo  ============================================================
 echo   - Node.js yoksa kurar (winget)
 echo   - PostgreSQL GEREKMEZ: gomulu veritabani kullanilir
-echo     (veriler: data\jarvis.db.tgz)
+echo     (veriler: %APPDATA%\JARVIS\jarvis.db.tgz - her kurulumda ayni)
 echo   - Paketleri kurar, paneli derler ve baslatir
 echo  ============================================================
 echo.
@@ -40,8 +40,8 @@ REM ---------- 2) Yerel veritabani ayari ----------
 REM .env.local, .env dosyasindaki sunucu adresini gecersiz kilar.
 REM Mevcut dosyaya DOKUNULMAZ: harici PostgreSQL ayari guncellemede kaybolmasin.
 if not exist .env.local (
-  >.env.local echo DATABASE_URL=pglite:./data/jarvis.db.tgz
-  echo [2/4] Gomulu veritabani: %CD%\data\jarvis.db.tgz
+  >.env.local echo DATABASE_URL=pglite:shared
+  echo [2/4] Gomulu veritabani: %APPDATA%\JARVIS\jarvis.db.tgz ^(yeni klasore kurulsa da veriler korunur^)
 ) else (
   echo [2/4] Mevcut .env.local korunuyor
 )

@@ -9,7 +9,7 @@
 | `jarvis_launcher.py` | EXE giriş noktası + kurulum sihirbazı (otomatik MT5 yolu bulma, bağlantı testi) |
 
 ## Python sürümü
-MetaTrader5 kütüphanesi **64-bit Python** için yayınlanır; bu proje **3.10–3.12** ile test edilmiştir. Derleme betikleri
+MetaTrader5 kütüphanesi yalnızca **64-bit Python 3.6–3.14** için yayınlanır. Derleme betikleri
 otomatik olarak **64-bit Python 3.11**'i bulur/kurar (`find_python.bat`); bilgisayardaki diğer
 Python sürümlerine dokunmaz. Hata alırsanız `.venv` klasörünü silip tekrar deneyin.
 
@@ -49,29 +49,12 @@ mevcut klasörünüzün üzerine kopyalayın (`config.json` değişmez), sonra a
 ## KANAL stratejisi (v2.7)
 `kanal_strategy.py` + `mql5/` klasörü: KANAL3BAND bandını kırıp geri dönüş + RSI 70/30 + CCI mor çizgi (CCI MA) kesişimi.
 - Ajan, MT5 **Piyasa Gözlemi'nde açık olan tüm pariteleri** seçili zaman dilimlerinde tarar (ayarlar panelde: *KANAL Strateji*).
-- Koşullar ilk kez tamamlandığında (5/5) sinyal üretir; Otomatik İşlem kapalıyken JARVIS sesli sorar, yalnızca "Evet" ile emir gider.
+- 4/4 koşul ilk kez sağlandığında sinyal üretir; JARVIS sesli sorar, yalnızca "Evet" ile emir gider.
 - **Ajan güncelleme:** `app.py`, `mt5_engine.py`, `kanal_strategy.py` dosyalarını mevcut klasörün üzerine kopyalayın, ajanı yeniden başlatın.
 - **MQL5 dosyaları:** panelde *MQL5 Stratejileri* sayfasında kayıtlıdır; "Derle" ile ajan MetaEditor'da derler
   (`MQL5\\Indicators\\Jarvis\\` ve `MQL5\\Experts\\Jarvis\\` altına yazılır). EA'yı bir grafiğe sürükleyin
   (Algo Trading açık). `InpAutoTrade` varsayılan **false** — yalnızca uyarı verir.
 - Centered YSR merkez çizgisi yeniden boyanır; strateji yalnızca kapanmış barlarda sağ uçtaki değerlerle çalışır.
-
-## v2.9 — KANAL otomatik işlem
-- **Kural sırası:** İLK kural fiyatın band aralığında **mum kapatması** (dönüş barı); RSI ve CCI onayı yalnızca dönüş barından
-  itibaren sayılır (`strictOrder`). Ardından RSI ve CCI son `confirmBars` barda **arka arkaya aynı yönde** olmalıdır (yön onayı).
-  Tabloda yeni **Sıra** ve **Yön** rozetleri; aşamalar 0–5.
-- **Güven skoru** (panel = ajan = EA): 40 + 12×kırılan band + 10×sıra + 10×yön + RSI aşırılığı (≤12) + CCI aşırılığı (≤8), en çok 97.
-- **SL:** ALIŞ → önceki dip veya RSI'ın dönüş yaptığı barın dibi (daha korumalı olan) − ATR payı; SATIŞ → tepe / RSI dönüş barının tepesi + ATR payı.
-  **TP:** ALIŞ → girişin üstündeki **en yakın üst band**, SATIŞ → girişin altındaki **en yakın alt band** (sinyalin geldiği zaman diliminin değerleri).
-- **Otomatik İşlem** (panel → KANAL Strateji → ⚡ Otomatik İşlem, varsayılan **KAPALI**): güven ≥ `autoMinConfidence` (%80) **ve** sıra ✓ **ve** yön ✓
-  olan sinyaller sorulmadan MT5'e gönderilir (`JARVIS AUTO <YÖN> <TF>` yorumuyla). Eşiği geçmeyenler eskisi gibi onayınıza sunulur.
-  Korumalar: Algo Trading/işlem izni, aynı paritede açık JARVIS işlemi yok, en çok `autoMaxOpen` (3) açık işlem, aynı bar için tek emir
-  (yeniden başlatmada da `.jarvis_state.json` ile korunur). Panelde sinyal ⚡ otomatik rozetiyle `executed`/`failed` olarak görünür.
-- **Breakeven:** JARVIS işlemi hedef yolunun `breakEvenPct`'sine (%30) ulaşınca SL giriş fiyatına çekilir (ajan `manage` iş parçacığı, 3 sn;
-  EA'da `ManageBreakEven`). Stops level engelliyorsa sonraki turda yeniden denenir.
-- **EA (KANAL_Strateji.mq5 v1.10):** aynı kurallar; yeni girişler `InpStrictOrder`, `InpConfirmBars`, `InpSlAnchor`, `InpTpMode`, `InpAutoMinConf`,
-  `InpMaxOpen`, `InpBreakEvenPct`. Ajanla birlikte kullanıyorsanız EA'da `InpAutoTrade` kapalı kalsın (çift emir açılmasın).
-- Ajan: panel erişilemediğinde gönderilemeyen sinyaller kaybolmaz, bir sonraki senkronda yeniden denenir.
 
 ## v2.8 — fiyat akışı, emir doğrulama, güncelleme
 - **Canlı fiyat akışı:** ajan her saniye bid/ask gönderir; panel grafiği ve fiyat listesi bununla akar (durum şeridinde "canlı · 0.8 sn").
@@ -81,3 +64,53 @@ mevcut klasörünüzün üzerine kopyalayın (`config.json` değişmez), sonra a
 - **Demo/eski sinyaller** gerçek MT5'e asla gitmez; 30 dk'dan eski bekleyen sinyaller süresi dolar.
 - **Sembol ekleri** (EURUSD.m, EURUSDm …) otomatik eşlenir.
 - **Güncelleme:** `CALISTIR.bat` ile açın → ajan her başlangıçta panelden yeni dosyaları indirir (config.json'a dokunmaz).
+
+## v2.9 — sohbet / sesli emirler, SL-TP değiştirme, broker sembol adları
+- **Sohbetten / sesle emir:** "EURUSD 0.1 lot al sl 30 tp 60", "altın sat", "buy gir" (grafikteki parite) → JARVIS özetler, **"Evet"** ile MT5'e gider ve sonucu söyler.
+- **SL/TP değiştirme MT5'e gider** (`TRADE_ACTION_SLTP`): "SL girişe çek", "xauusd sl 4150 yap", "tp 80 pip", "sl kaldır", "hepsinin SL girişe çek". İşlemler sayfasında **SL→Giriş** düğmesi.
+- **Kapatma:** "NAS100 kapat", "hepsini kapat" (birden çok işlemde onay ister).
+- **Broker sembol adları otomatik eşlenir:** US100 → NAS100/USTEC, US30 → DJ30/WS30, XAUUSD → GOLD, EURUSD → EURUSD.m … Bulunamazsa benzer adları önerir.
+
+## v3.0 — Otomatik işlem (isteğe bağlı), yeni SL/TP, girişe çekme
+- **Otomatik işlem** (panel → KANAL Strateji → Otomatik İşlem, varsayılan KAPALI): fiyat band içine döndü + RSI + CCI onayı (4/4) ve
+  **güven ≥ %80** ise JARVIS sormadan işleme girer; altındaysa yine sorar. Otomatik pozisyonlar ayrı magic (`magic+1`) ve `JARVIS AUTO` yorumuyla açılır.
+  Aynı paritede açık pozisyon varsa atlar; en fazla N otomatik pozisyon.
+- **Güven puanı:** 45 + 12×kırılan band + RSI gücü (0-10) + CCI–MA farkı (0-5) + risk/ödül (0-5).
+- **SL:** ALIŞ → bandın dönüş yaptığı dip, SATIŞ → dönüş tepesi (+0.1×ATR pay); istenirse "bir önceki dip/tepe".
+- **TP:** ALIŞ → girişin üstündeki en yakın üst band, SATIŞ → altındaki en yakın alt band.
+- **SL girişe çekme:** fiyat TP'ye olan mesafenin %30'unu kâra geçince SL giriş fiyatına çekilir (ayarlanabilir).
+
+## v3.1 — KANAL stratejisi v2 (yeni kural)
+- **Zaman dilimleri:** yalnızca 3dk / 5dk / 15dk / 1sa (panelden seçilir).
+- **ALIŞ:** mum TÜM alt bantların (en dış bant) dışında KAPANIR → RSI 30 altında → RSI 30'u yukarı keser → CCI mor çizgiyi yukarı keser.
+- **SATIŞ:** mum TÜM üst bantların dışında KAPANIR → RSI 70 üstünde → RSI 70'i aşağı keser → CCI mor çizgiyi aşağı keser.
+- **SL:** ALIŞ → RSI 30'u yukarı kesmeden önceki en düşük fiyat · SATIŞ → RSI 70'i aşağı kesmeden önceki en yüksek fiyat.
+- **TP:** bandın merkez çizgisi (ilk hedef). Otomatik işlem / güven eşiği / %30'da girişe çekme aynen çalışır.
+- **EA:** `mql5/KANAL_Strateji.mq5` v3.10 aynı kuralla; girişlerden M3/M5/M15/H1 seçilir, Piyasa Gözlemi taranır.
+- **Güven:** 60 + bant dışı derinlik (0-10) + RSI aşırılığı (0-15) + CCI–MA farkı (0-5) + risk/ödül (0-10).
+
+## v3.1.1 — düzeltmeler
+- **`cublas64_12.dll` hatası:** bilgisayarda NVIDIA GPU var ama CUDA 12 kütüphaneleri yoksa ses tanıma artık otomatik **CPU**'ya geçer
+  (açılışta test edilir; çalışırken hata olursa da geçer). GPU için: `.venv\Scripts\pip install nvidia-cublas-cu12 "nvidia-cudnn-cu12==9.*"`.
+- **Ses döngüsü çökmez:** hata olursa kaydedilir ve devam eder; üst üste 5 hatada dinleme kapanır, onaylar panelden verilir.
+- **Ajan anahtarı:** panel anahtarı reddederse (401) açık uyarı verilir ve kurulum penceresi kendiliğinden açılır.
+- **Panel verileri** artık `%APPDATA%\JARVIS\jarvis.db.tgz` içinde (proje klasöründen bağımsız). Eski klasörlerdeki veri ilk açılışta otomatik kopyalanır.
+
+## v3.2 — geri dönüş şartı, yarı kâr al, takip listesi, işlem zaman dilimi
+- **Strateji:** bant dışı kapanış sonrası fiyat **bantların içine dönmeden** işlem açılmaz (5 koşul). RSI/CCI kesişimi en fazla 10 mum önce
+  olabilir ve şu an hâlâ onaylı olmalı; sinyal genelde içeri dönüş mumunda çıkar.
+- **Yarı kâr al:** fiyat TP yolunun %50'sine ulaşınca lotun yarısı kapatılır (ayarlanabilir). %30'da SL girişe. JARVIS'in açtığı tüm işlemlerde
+  (sinyal onayı, hızlı emir, otomatik) çalışır. Panelde "½ Kapat", sohbette "yarısını kapat".
+- **Takip listesi:** strateji yalnızca seçtiğin pariteleri tarar (Panel → Takip Listesi). İstenirse Piyasa Gözlemi'nin tamamı.
+- **İşlem zaman dilimi:** emir yorumu artık TF içerir ("JARVIS BUY M15 #12", "JARVIS AUTO M5"); panelde her işlemin TF'si görünür.
+
+## v3.2.1 — işlem zaman dilimi düzeltmesi
+- Zaman dilimi artık MT5 yorumuna bağlı değil (brokerlar yorumu silebiliyor): ajan açtığı her pozisyonun TF'sini `tf_map.json`'a kaydeder
+  ve panele bildirir. Ek yedekler: bilet numarası → sinyal, yorum ("KANAL BUY PERIOD_M15" dahil), #sinyal numarası.
+- MT5'te elle açılan işlemlerde TF bilinemez: İşlemler sayfasında "＋TF"ye tıklayıp elle atayabilirsiniz.
+
+## v3.3 — Telegram bot + Piyasa & Grafik zaman dilimi seçimi
+- **Telegram** (Panel → Telegram Bot): bot token + chat ID. Sinyal geldiğinde bildirim: hangi kanala temas ettiği / kanal taşması,
+  o anki RSI durumu (değer + aşırı alım/satım notu), CCI/mor çizgi, giriş-SL-TP ve R:R. Düğmeler: ✅ Evet gir / ❌ Hayır / 📊 Panelde aç / 🔕 30 dk sessiz.
+  Düğmelerin çalışması için ajan açık olmalı (ajan `getUpdates` ile dinler, eylemi panele iletir; işlem kuralları aynen uygulanır).
+- **Piyasa & Grafik → Zaman Dilimi:** seçtiğin dil bütün paritelere uygulanır (fiyat, değişim, RSI, grafik, radar). “Tümü” ile eski hâle dönülür.

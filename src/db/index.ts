@@ -1,5 +1,6 @@
 import path from "path";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync, unlinkSync } from "fs";
+import os from "os";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync, unlinkSync } from "fs";
 import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
 import { drizzle as drizzlePglite } from "drizzle-orm/pglite";
 import type { PGlite as PGliteT } from "@electric-sql/pglite";
@@ -27,14 +28,51 @@ const g = globalThis as typeof globalThis & {
   __jarvisPglite?: PGliteT;
 };
 
+/** Ortak veri yeri: proje klasöründen BAĞIMSIZ (yeni klasöre kurulsa da aynı veriler + aynı ajan anahtarı). */
+export function sharedDataFile() {
+  const base = process.env.JARVIS_DATA_DIR
+    || (process.platform === "win32" ? path.join(process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming"), "JARVIS") : path.join(os.homedir(), ".jarvis"));
+  return path.join(base, "jarvis.db.tgz");
+}
+
+/**
+ * Ortak dosya henüz yoksa önceki kurulumların verisini bulur (bir kez, KOPYALAYARAK — eskiler silinmez):
+ * bu klasörün data\ dizini + yan klasörler (örn. İndirilenler\local-ai-mt5-jarvis (5)\data\jarvis.db.tgz). En yenisi seçilir.
+ */
+function migrateLegacy(target: string) {
+  if (existsSync(target)) return;
+  const cands: string[] = [];
+  const add = (f: string) => { try { if (existsSync(f) && statSync(f).size > 1000) cands.push(f); } catch {} };
+  const cwd = process.cwd();
+  add(path.join(cwd, "data", "jarvis.db.tgz"));
+  try {
+    const parent = path.dirname(cwd);
+    for (const d of readdirSync(parent, { withFileTypes: true }).slice(0, 300))
+      if (d.isDirectory() && path.join(parent, d.name) !== cwd) add(path.join(parent, d.name, "data", "jarvis.db.tgz"));
+  } catch {}
+  if (!cands.length) return;
+  cands.sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs);
+  mkdirSync(path.dirname(target), { recursive: true });
+  copyFileSync(cands[0], target);
+  console.log(`[db] Önceki kurulumdaki veriler ortak konuma taşındı (kopya): ${cands[0]} -> ${target}`);
+}
+
 function snapshotPath() {
-  let raw = url.replace(/^pglite:?/i, "").trim() || "data/jarvis.db.tgz";
+  const raw0 = url.replace(/^pglite:?/i, "").trim();
+  // "pglite", "pglite:shared" ve eski varsayılan "./data/jarvis.db.tgz" -> ortak konum
+  if (!raw0 || /^shared$/i.test(raw0) || /^(\.[\\/])?data[\\/]jarvis\.db\.tgz$/i.test(raw0)) {
+    const f = sharedDataFile();
+    try { migrateLegacy(f); } catch (e) { console.error("[db] eski veri taşınamadı:", e); }
+    return f;
+  }
+  let raw = raw0;
   // Eski sürüm klasör yolu verdiyse (data/jarvis-db) dosya adına çevir
   if (!/\.(tgz|tar\.gz|tar)$/i.test(raw)) raw = raw.replace(/[\\/]+$/, "") + ".db.tgz";
   return path.resolve(process.cwd(), raw);
 }
 
 function createPglite(): DB {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
   const { PGlite } = require("@electric-sql/pglite") as typeof import("@electric-sql/pglite");
   const file = snapshotPath();
   const lock = file + ".lock";
@@ -158,8 +196,7 @@ function createServer(): DB {
   g.__jarvisPool = pool;
   if (fresh) {
     // Harici PostgreSQL: boş bir veritabanında da çalışsın diye şema (BOOTSTRAP, idempotent CREATE IF NOT EXISTS)
-    // ve ardından sütun geçişleri (MIGRATION) uygulanır. İlk sorgular bu iş bitene kadar bekletilir;
-    // böylece "relation users does not exist" türü yarış hataları oluşmaz.
+    // ve ardından sütun geçişleri (MIGRATION) uygulanır. İlk sorgular bu iş bitene kadar bekletilir.
     const ready = (async () => {
       for (const q of BOOTSTRAP_SQL) await pool.query(q).catch((e) => console.error("[db] şema uyarısı:", String(e.message).slice(0, 120)));
       for (const q of MIGRATION_SQL) await pool.query(q).catch((e) => console.error("[db] geçiş uyarısı:", String(e.message).slice(0, 120)));

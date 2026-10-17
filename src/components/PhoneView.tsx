@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Button, Card, PageHeader, Skeleton, Spinner, api, cx, useToast } from "./ui";
 
 type PhoneUrl = { label: string; base: string; link: string; qr: string };
-type Resp = { urls: PhoneUrl[]; expiresAt: string; local: boolean; port: string; lanMode: boolean | null };
+type Resp = { urls: PhoneUrl[]; expiresAt: string; local: boolean; port: string };
 
 export default function PhoneView() {
   const toast = useToast();
@@ -41,13 +41,6 @@ export default function PhoneView() {
   return (
     <div className="max-w-5xl">
       <PageHeader title="TELEFON BAĞLANTISI" sub="QR kodu telefonunun kamerasıyla okut — giriş yapmadan komuta merkezi telefonunda açılır." />
-      {data?.local && data.lanMode === false && (
-        <div className="mb-4 rounded-xl border border-amber-400/40 bg-amber-400/10 p-4 text-sm text-amber-100">
-          <b>Panel şu an yalnızca bu bilgisayardan erişilebilir</b> (güvenli varsayılan). Telefonun bağlanabilmesi için paneli ağ modunda başlatın:
-          <code className="mx-1 rounded bg-black/40 px-1.5 py-0.5 text-cyan-200">PANEL_BASLAT.bat lan</code>
-          — ve ağ modunda <b>demo şifresini mutlaka değiştirin</b> (sol alt menü → Şifre değiştir).
-        </div>
-      )}
       <div className="grid gap-4 md:grid-cols-[380px_minmax(0,1fr)]">
         <Card title="QR ile Bağlan" icon="▯">
           {!data ? <Skeleton rows={5} /> : !cur ? (
@@ -83,7 +76,7 @@ export default function PhoneView() {
           <Card title="Nasıl Çalışır?" icon="◈">
             <ol className="list-decimal space-y-2 pl-5 text-sm text-slate-300">
               <li>Telefon ve bilgisayar <b>aynı Wi-Fi ağında</b> olmalı.</li>
-              <li>Bilgisayarda panel <b>ağ modunda</b> açık kalmalı: <code className="text-cyan-200">PANEL_BASLAT.bat lan</code> (varsayılan başlatma yalnızca bu bilgisayara açıktır).</li>
+              <li>Bilgisayarda panel açık kalmalı (<code className="text-cyan-200">PANEL_BASLAT.bat</code> penceresi).</li>
               <li>Telefon kamerasını QR&apos;a tutun ve çıkan bağlantıya dokunun → komuta merkezi açılır, oturum otomatik açılır.</li>
               <li>Tarayıcı menüsünden <b>“Ana ekrana ekle”</b> derseniz uygulama gibi tek dokunuşla açılır.</li>
             </ol>
@@ -96,7 +89,7 @@ export default function PhoneView() {
               <li><b>QR süresi doldu / “expired”:</b> “Yeni QR üret” — her QR yalnızca bir kez kullanılır.</li>
               <li><b>Birden fazla adres var:</b> 192.168.x.x ile başlayan Wi-Fi adresini seçin.</li>
               <li><b>Telefonda mikrofon:</b> tarayıcılar mikrofonu yalnızca <b>https</b> adreslerde açar; yerel ağda (http) yazarak komut verebilir, JARVIS&apos;in sesli yanıtlarını duyabilirsiniz. Sesli komutlar için bilgisayardaki ajan (faster-whisper) kullanılır.</li>
-              <li><b>Güvenlik:</b> Ağ modunda aynı Wi-Fi&apos;deki herkes giriş sayfasını görür — <b>demo şifresini değiştirin</b>. QR tek kullanımlıktır ve 10 dk geçerlidir. Paneli internete açmayın; uzaktan erişim için VPN (ör. Tailscale) kullanın.</li>
+              <li><b>Güvenlik:</b> QR yalnızca aynı ağdaki cihazlarda çalışır. Paneli internete açmayın; uzaktan erişim için VPN (ör. Tailscale) kullanın.</li>
             </ul>
           </Card>
         </div>

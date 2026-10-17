@@ -103,6 +103,7 @@ export const trades = pgTable("trades", {
   pnl: doublePrecision("pnl").default(0).notNull(),
   status: text("status").default("open").notNull(), // open|closing|closed
   source: text("source").default("demo").notNull(),
+  timeframe: text("timeframe").default("").notNull(), // işlemin açıldığı zaman dilimi (M3/M5/M15/H1…, MAN = elle)
   comment: text("comment").default("").notNull(),
   openedAt: timestamp("opened_at").defaultNow().notNull(),
   closedAt: timestamp("closed_at"),
@@ -153,8 +154,45 @@ export const kanalSettings = pgTable("kanal_settings", {
   userId: integer("user_id").primaryKey(),
   enabled: boolean("enabled").default(true).notNull(),
   timeframes: text("timeframes").default("M15,H1").notNull(),
-  scanAll: boolean("scan_all").default(true).notNull(), // Piyasa Gözlemi'ndeki tüm pariteler
+  scanAll: boolean("scan_all").default(true).notNull(), // (eski) Piyasa Gözlemi'ndeki tüm pariteler
+  scanMode: text("scan_mode").default("list").notNull(), // list = takip listem · marketwatch = Piyasa Gözlemi'nin tamamı
+  symbols: jsonb("symbols").$type<string[]>().default([]).notNull(), // takip listesi
   lot: doublePrecision("lot").default(0.1).notNull(),
   params: jsonb("params").$type<Record<string, number | string | boolean>>().default({}).notNull(),
+  /** Otomatik işlem: { enabled, minConf, maxPositions, beAtPct, beAll } */
+  auto: jsonb("auto").$type<Record<string, number | boolean>>().default({}).notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
+});
+
+/** MT5'e gidecek pozisyon komutları (SL/TP değiştir, kapat) — ajan uygular ve sonucu bildirir. */
+export const tradeCommands = pgTable("trade_commands", {
+  id: serial("id").primaryKey(),
+  userId: integer("user_id").notNull(),
+  ticket: text("ticket").notNull(),
+  symbol: text("symbol").notNull(),
+  type: text("type").notNull(), // modify | close | partial
+  fraction: doublePrecision("fraction"), // partial: kapatılacak oran (0.5 = yarısı)
+  sl: doublePrecision("sl"), // null = değiştirme, 0 = kaldır
+  tp: doublePrecision("tp"),
+  status: text("status").default("queued").notNull(), // queued | sent | done | failed
+  note: text("note").default("").notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  doneAt: timestamp("done_at"),
+});
+
+/** Telegram bot bildirim ayarları (sinyal / otomatik işlem / kâr yönetimi / hata). */
+export const telegramSettings = pgTable("telegram_settings", {
+  userId: integer("user_id").primaryKey(),
+  enabled: boolean("enabled").default(false).notNull(),
+  botToken: text("bot_token").default("").notNull(),
+  chatId: text("chat_id").default("").notNull(),
+  onSignal: boolean("on_signal").default(true).notNull(),   // KANAL sinyali (onay bekleyen)
+  onAuto: boolean("on_auto").default(true).notNull(),       // otomatik açılan işlem
+  onProfit: boolean("on_profit").default(true).notNull(),   // SL girişe çekme / yarı kâr
+  onError: boolean("on_error").default(true).notNull(),     // emir reddi / hata
+  minConf: integer("min_conf").default(70).notNull(),       // sinyal bildirimi için alt güven eşiği
+  quietUntil: timestamp("quiet_until"),                     // bu saate kadar bildirim gönderme
+  buttons: boolean("buttons").default(true).notNull(),      // bildirime onay/reddet düğmeleri ekle
+  createdAt: timestamp("created_at").defaultNow().notNull(),
   updatedAt: timestamp("updated_at").defaultNow().notNull(),
 });

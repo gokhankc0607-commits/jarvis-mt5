@@ -11,6 +11,7 @@ local_ai.py — JARVIS yerel zekâ, konuşma ve dinleme modülü
 from __future__ import annotations
 
 import io
+import os
 import logging
 import queue
 import re
@@ -92,16 +93,74 @@ class LLMClient:
 # --------------------------------------------------------------------------- #
 # STT — faster-whisper
 # --------------------------------------------------------------------------- #
+def _add_nvidia_dll_dirs() -> None:
+    """Windows: pip ile kurulan NVIDIA kütüphanelerini (nvidia-cublas-cu12, nvidia-cudnn-cu12) DLL arama yoluna ekler."""
+    if os.name != "nt":
+        return
+    import glob
+    import site
+
+    roots = list(getattr(site, "getsitepackages", lambda: [])()) + [getattr(site, "getusersitepackages", lambda: "")()]
+    for r in roots:
+        for d in glob.glob(os.path.join(r or "", "nvidia", "*", "bin")):
+            try:
+                os.add_dll_directory(d)
+            except Exception:  # noqa: BLE001
+                pass
+            os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
+
+
+GPU_HINT = ("GPU (CUDA 12) kütüphaneleri bulunamadı (cublas64_12.dll / cuDNN) → ses tanıma CPU'da çalışacak. "
+            "GPU istiyorsanız: .venv\\Scripts\\pip install nvidia-cublas-cu12 \"nvidia-cudnn-cu12==9.*\"")
+
+
 class SpeechToText:
     def __init__(self, model_size: str = "small", device: str = "auto", compute_type: str = "int8",
                  language: str = "tr", sample_rate: int = 16000, on_level: LevelCB = None) -> None:
-        from faster_whisper import WhisperModel  # lazy import
-
-        log.info("faster-whisper yükleniyor: %s (%s/%s)", model_size, device, compute_type)
-        self.model = WhisperModel(model_size, device=device, compute_type=compute_type)
+        self.model_size = model_size
+        self.compute_type = compute_type
         self.language = language
         self.sr = sample_rate
         self.on_level = on_level
+        dev = (device or "auto").lower()
+        if dev in ("auto", "cuda", "gpu"):
+            _add_nvidia_dll_dirs()
+            if dev == "auto":
+                try:
+                    import ctranslate2
+
+                    dev = "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
+                except Exception:  # noqa: BLE001
+                    dev = "cpu"
+            else:
+                dev = "cuda"
+        self.device = dev
+        self.model = self._load(dev)
+        # GPU seçildiyse gerçek bir çözümleme ile dene: cuBLAS/cuDNN eksikse hata ancak burada çıkar -> CPU'ya geç
+        if self.device == "cuda" and not self._warmup():
+            log.warning(GPU_HINT)
+            self.device = "cpu"
+            self.model = self._load("cpu")
+        log.info("Ses tanıma hazır: faster-whisper %s · %s", self.model_size, self.device.upper())
+
+    def _load(self, dev: str):  # noqa: ANN202
+        from faster_whisper import WhisperModel  # lazy import
+
+        ct = self.compute_type
+        if dev == "cpu" and "float16" in ct:
+            ct = "int8"  # CPU float16 desteklemez
+        log.info("faster-whisper yükleniyor: %s (%s/%s)", self.model_size, dev, ct)
+        return WhisperModel(self.model_size, device=dev, compute_type=ct)
+
+    def _warmup(self) -> bool:
+        try:
+            segs, _ = self.model.transcribe(np.zeros(self.sr, dtype=np.float32), language=self.language,
+                                            beam_size=1, vad_filter=False, without_timestamps=True)
+            list(segs)
+            return True
+        except Exception as e:  # noqa: BLE001
+            log.debug("GPU denemesi başarısız: %s", e)
+            return False
 
     def record(self, max_seconds: float = 8.0, silence_sec: float = 0.9, start_timeout: float = 6.0,
                threshold: float = 0.012) -> np.ndarray:
@@ -148,9 +207,20 @@ class SpeechToText:
     def transcribe(self, audio: np.ndarray) -> str:
         if audio.size < self.sr * 0.3:
             return ""
-        segments, _ = self.model.transcribe(audio, language=self.language, beam_size=1, vad_filter=True,
-                                            initial_prompt="Jarvis, evet, hayır, işlem, parite, derle, durum.")
-        return " ".join(s.text.strip() for s in segments).strip()
+        def run() -> str:
+            segments, _ = self.model.transcribe(audio, language=self.language, beam_size=1, vad_filter=True,
+                                                initial_prompt="Jarvis, evet, hayır, işlem, parite, derle, durum.")
+            return " ".join(s.text.strip() for s in segments).strip()
+
+        try:
+            return run()
+        except RuntimeError as e:
+            if self.device == "cpu":
+                raise
+            log.warning("%s (%s)", GPU_HINT, str(e)[:80])  # çalışırken GPU hatası -> CPU'ya geç, tekrar dene
+            self.device = "cpu"
+            self.model = self._load("cpu")
+            return run()
 
     def listen(self, **kw) -> str:  # noqa: ANN003
         text = self.transcribe(self.record(**kw))

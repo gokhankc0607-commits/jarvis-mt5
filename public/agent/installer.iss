@@ -1,7 +1,7 @@
 ; Inno Setup 6 — JARVIS kurulum paketi
 ; Derleme: "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss  (önce build_exe.bat)
 #define AppName "JARVIS"
-#define AppVersion "2.9.0"
+#define AppVersion "3.3.0"
 
 [Setup]
 AppId={{6E1B7A52-4C2D-4B7E-9A3F-1A2B3C4D5E6F}

@@ -1,5 +1,5 @@
-export const TFS = ["M1", "M5", "M15", "M30", "H1", "H4", "D1"] as const;
-export const TF_MIN: Record<string, number> = { M1: 1, M5: 5, M15: 15, M30: 30, H1: 60, H4: 240, D1: 1440 };
+export const TFS = ["M1", "M3", "M5", "M15", "M30", "H1", "H4", "D1"] as const;
+export const TF_MIN: Record<string, number> = { M1: 1, M3: 3, M5: 5, M15: 15, M30: 30, H1: 60, H4: 240, D1: 1440 };
 
 /** "M15,H1" -> ["M15","H1"] (geçersizleri atar, küçükten büyüğe sıralar) */
 export function parseTfs(s: string | null | undefined): string[] {
@@ -19,8 +19,8 @@ export type Category = "forex" | "crypto" | "metals" | "indices" | "commodities"
 export function categoryOf(symbol: string): Category {
   const s = symbol.toUpperCase();
   if (/^(BTC|ETH|LTC|XRP|SOL|DOGE|ADA|BNB|DOT|AVAX)/.test(s)) return "crypto";
-  if (/^X(AU|AG|PT|PD)/.test(s)) return "metals";
-  if (/^(US30|US100|US500|USTEC|NAS|SPX|GER|DE40|DE30|DAX|UK100|JP225|FRA40|EU50|DJ|NDX)/.test(s)) return "indices";
+  if (/^(X(AU|AG|PT|PD)|GOLD|SILVER)/.test(s)) return "metals";
+  if (/^(US30|US100|US500|USTEC|NAS|SPX|SP500|GER|DE40|DE30|DAX|UK100|FTSE|JP225|JPN225|FRA40|EU50|DJ|DOW|WS30|NDX|AUS200|HK50)/.test(s)) return "indices";
   if (/^(USOIL|UKOIL|WTI|BRENT|NGAS|XTI|XBR|XNG|COPPER|OIL)/.test(s)) return "commodities";
   if (/^(AAPL|TSLA|MSFT|NVDA|AMZN|GOOG|META|NFLX|AMD)/.test(s)) return "stocks";
   return "forex";

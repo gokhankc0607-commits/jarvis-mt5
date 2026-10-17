@@ -7,7 +7,7 @@ import {
 } from "lightweight-charts";
 import { type Candle, type RadarCfg } from "@/lib/indicators";
 import { kanalSeries, KANAL_DEFAULTS, type KanalParams } from "@/lib/kanal";
-import { Spinner } from "./ui";
+import { Spinner, cx } from "./ui";
 
 type TradeLine = { side: string; volume: number; openPrice: number; sl: number | null; tp: number | null };
 type Resp = { live: boolean; candles: Candle[]; ageMs: number | null; tick: { bid: number; ask: number; age: number; stale: number } | null; cfg: RadarCfg; kp?: KanalParams; trades: TradeLine[] };
@@ -30,6 +30,10 @@ export default function PriceChart({
     lines: IPriceLine[]; ref: { ser: ISeriesApi<"Line">; line: IPriceLine }[]; fitted: string;
   }>({ up: [], dn: [], lines: [], ref: [], fitted: "" });
   const [state, setState] = useState<"loading" | "ok" | "empty">("loading");
+  const followRef = useRef(true); // canlı ucu takip et (kullanıcı geriye kaydırınca durur)
+  const [following, setFollowing] = useState(true);
+  const [freeY, setFreeY] = useState(false); // dikey serbest kaydırma (otomatik ölçek kapalı)
+  const lastLen = useRef(0);
   const infoRef = useRef(onInfo);
   infoRef.current = onInfo;
 
@@ -43,8 +47,21 @@ export default function PriceChart({
       rightPriceScale: { borderColor: "rgba(56,189,248,0.25)" },
       timeScale: { borderColor: "rgba(56,189,248,0.25)", timeVisible: true, secondsVisible: false, rightOffset: 4 },
       crosshair: { mode: CrosshairMode.Normal },
+      // sürükle-kaydır (yatay + otomatik ölçek kapalıyken dikey), tekerlek/pinç yakınlaştır, eksenleri sürükleyerek ölçekle
+      handleScroll: { mouseWheel: true, pressedMouseMove: true, horzTouchDrag: true, vertTouchDrag: true },
+      handleScale: { mouseWheel: true, pinch: true, axisPressedMouseMove: { time: true, price: true }, axisDoubleClickReset: { time: true, price: true } },
+      kineticScroll: { mouse: true, touch: true },
     });
     chartRef.current = chart;
+    // kullanıcı geçmişe kaydırınca canlı takibi durdur, sağ uca dönünce yeniden başlat
+    chart.timeScale().subscribeVisibleLogicalRangeChange(() => {
+      const pos = chart.timeScale().scrollPosition();
+      const f = pos > -2;
+      if (f !== followRef.current) {
+        followRef.current = f;
+        setFollowing(f);
+      }
+    });
     const s: typeof S.current = { up: [], dn: [], lines: [], ref: [], fitted: "" };
     S.current = s;
     s.candle = chart.addSeries(CandlestickSeries, {
@@ -74,6 +91,37 @@ export default function PriceChart({
     };
   }, [osc]);
 
+  /** Görünümü sıfırla: son ~150 mum, tüm fiyat eksenlerinde otomatik ölçek, canlı takip açık. */
+  const resetView = (n?: number) => {
+    const ch = chartRef.current;
+    if (!ch) return;
+    const len = n ?? lastLen.current;
+    ch.priceScale("right").applyOptions({ autoScale: true });
+    try {
+      // RSI / CCI panellerinin fiyat ölçekleri
+      [S.current.rsi, S.current.cci].forEach((ser) => ser?.priceScale().applyOptions({ autoScale: true }));
+    } catch {}
+    ch.timeScale().setVisibleLogicalRange({ from: Math.max(0, len - 150), to: len + 4 });
+    followRef.current = true;
+    setFollowing(true);
+    setFreeY(false);
+  };
+  const zoom = (k: number) => {
+    const ts = chartRef.current?.timeScale();
+    const r = ts?.getVisibleLogicalRange();
+    if (!ts || !r) return;
+    const mid = followRef.current ? r.to : (r.from + r.to) / 2;
+    const half = Math.max(10, ((r.to - r.from) * k) / 2);
+    ts.setVisibleLogicalRange(followRef.current ? { from: mid - half * 2, to: mid } : { from: mid - half, to: mid + half });
+  };
+  const toggleFreeY = () => {
+    const ch = chartRef.current;
+    if (!ch) return;
+    const v = !freeY;
+    ch.priceScale("right").applyOptions({ autoScale: !v });
+    setFreeY(v);
+  };
+
   /* ---- veriyi çek ve çiz ---- */
   useEffect(() => {
     let dead = false;
@@ -90,8 +138,8 @@ export default function PriceChart({
         if (!cs.length) { setState("empty"); return; }
         const t = (c: Candle) => T(c.time + off);
         // Kullanıcı canlı uçtaysa, yeni mum eklendiğinde görünümü kaydır (aksi halde son fiyat ekran dışında kalır)
-        const ts0 = chartRef.current.timeScale();
-        const atEdge = s.fitted === `${symbol}|${tf}` ? ts0.scrollPosition() >= 0 : false;
+        const newBar = cs.length !== lastLen.current;
+        lastLen.current = cs.length;
         s.candle?.setData(cs.map((c) => ({ time: t(c), open: c.open, high: c.high, low: c.low, close: c.close })));
         s.vol?.setData(cs.map((c) => ({ time: t(c), value: c.volume, color: c.close >= c.open ? "rgba(52,211,153,0.3)" : "rgba(251,113,133,0.3)" })));
         const toLine = (arr: (number | null)[]) => arr.flatMap((v, i) => (v === null ? [] : [{ time: t(cs[i]), value: v }]));
@@ -100,7 +148,7 @@ export default function PriceChart({
         const ks = kanalSeries(cs, kp);
         s.center?.setData(toLine(ks.center));
         for (let k = 0; k < 3; k++) {
-          const sel = kp.band === k + 1;
+          const sel = [kp.atrMult1, kp.atrMult2, kp.atrMult3][k] === Math.max(kp.atrMult1, kp.atrMult2, kp.atrMult3); // en dış bant (strateji bunu kullanır)
           s.up[k]?.setData(toLine(ks.up[k]));
           s.dn[k]?.setData(toLine(ks.dn[k]));
           s.up[k]?.applyOptions({ lineWidth: sel ? 2 : 1 });
@@ -133,10 +181,10 @@ export default function PriceChart({
         }
         const key = `${symbol}|${tf}`;
         if (s.fitted !== key) {
-          const n = cs.length;
-          chartRef.current.timeScale().setVisibleLogicalRange({ from: Math.max(0, n - 150), to: n + 4 });
+          // YENİ PARİTE / ZAMAN DİLİMİ: görünümü ve fiyat eksenini sıfırla (eski paritenin fiyat aralığında kalmasın)
+          resetView(cs.length);
           s.fitted = key;
-        } else if (atEdge) {
+        } else if (followRef.current && newBar) {
           chartRef.current.timeScale().scrollToRealTime();
         }
 
@@ -151,6 +199,14 @@ export default function PriceChart({
       }
     };
     S.current.fitted = "";
+    lastLen.current = 0;
+    // eski paritenin mumlarını hemen kaldır (yeni veri gelene kadar yanlış fiyat görünmesin)
+    try {
+      const s0 = S.current;
+      s0.candle?.setData([]); s0.vol?.setData([]); s0.center?.setData([]);
+      s0.up.forEach((x) => x.setData([])); s0.dn.forEach((x) => x.setData([]));
+      s0.rsi?.setData([]); s0.cci?.setData([]); s0.cciMa?.setData([]);
+    } catch {}
     load();
     const iv = setInterval(load, refreshMs);
     return () => { dead = true; clearInterval(iv); };
@@ -158,7 +214,18 @@ export default function PriceChart({
 
   return (
     <div className="relative w-full" style={{ height }}>
-      <div ref={box} className="absolute inset-0" />
+      <div ref={box} className="absolute inset-0" onDoubleClick={() => resetView()} />
+      {state === "ok" && (
+        <div className="absolute left-1.5 top-1.5 z-10 flex flex-wrap gap-1 text-[11px]">
+          <button onClick={() => resetView()} title="Ortala: son mumlar + otomatik fiyat ölçeği (çift tıklama da olur)" className="rounded-md border border-cyan-400/30 bg-black/60 px-1.5 py-0.5 font-bold text-cyan-100 hover:bg-cyan-400/20">⟲ Ortala</button>
+          <button onClick={() => zoom(0.7)} title="Yakınlaştır" className="rounded-md border border-cyan-400/30 bg-black/60 px-1.5 py-0.5 font-bold text-cyan-100 hover:bg-cyan-400/20">＋</button>
+          <button onClick={() => zoom(1.4)} title="Uzaklaştır" className="rounded-md border border-cyan-400/30 bg-black/60 px-1.5 py-0.5 font-bold text-cyan-100 hover:bg-cyan-400/20">－</button>
+          <button onClick={toggleFreeY} title="Dikey serbest kaydırma: grafiği yukarı/aşağı sürükleyin" className={cx("rounded-md border px-1.5 py-0.5 font-bold", freeY ? "border-amber-400/60 bg-amber-400/20 text-amber-100" : "border-cyan-400/30 bg-black/60 text-cyan-100 hover:bg-cyan-400/20")}>↕ {freeY ? "Serbest" : "Oto ölçek"}</button>
+          {!following && (
+            <button onClick={() => { chartRef.current?.timeScale().scrollToRealTime(); followRef.current = true; setFollowing(true); }} title="Canlı uca dön" className="rounded-md border border-emerald-400/50 bg-emerald-400/15 px-1.5 py-0.5 font-bold text-emerald-100 hover:bg-emerald-400/25">⏭ Canlı</button>
+          )}
+        </div>
+      )}
       {state !== "ok" && (
         <div className="absolute inset-0 flex items-center justify-center text-center text-sm text-slate-400">
           {state === "loading" ? <span className="flex items-center gap-2"><Spinner /> grafik yükleniyor…</span> : (

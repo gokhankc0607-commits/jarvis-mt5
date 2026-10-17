@@ -44,8 +44,6 @@ export async function GET() {
         return { ...b, link, qr };
       })
     );
-    // PANEL_BASLAT.bat yalnızca "lan" modunda JARVIS_LAN=1 verir; aksi hâlde panel 127.0.0.1'e bağlıdır ve telefon ulaşamaz.
-    const lanMode = process.env.JARVIS_LAN === "1" ? true : process.env.JARVIS_LAN === undefined ? null : false;
-    return Response.json({ urls, expiresAt, local: isLocal, port, lanMode });
+    return Response.json({ urls, expiresAt, local: isLocal, port });
   });
 }

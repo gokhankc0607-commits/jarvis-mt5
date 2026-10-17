@@ -1,6 +1,6 @@
 import { eq } from "drizzle-orm";
 import { db } from "@/db";
-import { watchRules } from "@/db/schema";
+import { kanalSettings, watchRules } from "@/db/schema";
 import { analyze, DEFAULT_CFG, type Candle, type RadarCfg } from "./indicators";
 import { getSeries, getTick } from "./live";
 import { TF_MIN, categoryOf, parseTfs, type Category } from "./tf";
@@ -19,6 +19,10 @@ export function loadCandlesMeta(userId: number, live: boolean, symbol: string, t
 }
 
 type Rule = typeof watchRules.$inferSelect;
+const DEFAULT_RULE = {
+  rsiPeriod: 14, rsiOverbought: 70, rsiOversold: 30, cciPeriod: 20, cciLevel: 100, stochEnabled: false, useDivergence: false,
+  lotSize: 0.1, slPips: 30, tpPips: 60, createdAt: new Date(0),
+};
 export const ruleCfg = (r?: Rule | null): RadarCfg =>
   r
     ? { rsiPeriod: r.rsiPeriod, rsiOverbought: r.rsiOverbought, rsiOversold: r.rsiOversold, cciPeriod: r.cciPeriod, cciLevel: r.cciLevel }
@@ -63,15 +67,24 @@ export type RadarRow = {
   cfg: { os: number; ob: number; cci: number };
 };
 
-export async function buildMarket(userId: number, live: boolean) {
-  const rules = await userRules(userId);
+export async function buildMarket(userId: number, live: boolean, tfFilter?: string | null) {
+  const tfOnly = tfFilter && TF_MIN[tfFilter] ? tfFilter : null; // tek zaman dilimi seçildiyse
+  const rules: (Rule & { fromList?: boolean })[] = await userRules(userId);
+  // KANAL takip listesindeki pariteler (izleme kuralı yoksa KANAL zaman dilimleriyle eklenir)
+  const [ks] = await db.select({ symbols: kanalSettings.symbols, timeframes: kanalSettings.timeframes }).from(kanalSettings).where(eq(kanalSettings.userId, userId)).limit(1);
+  const ruleSyms = new Set(rules.map((r) => r.symbol.toUpperCase()));
+  for (const sym of (Array.isArray(ks?.symbols) ? ks.symbols : []) as string[]) {
+    if (ruleSyms.has(String(sym).toUpperCase())) continue;
+    rules.push({ ...rules[0], ...DEFAULT_RULE, id: -1, userId, symbol: String(sym).toUpperCase(), timeframe: ks?.timeframes || "M15", enabled: true, fromList: true } as Rule & { fromList?: boolean });
+  }
   const quotes: Quote[] = [];
   const radar: RadarRow[] = [];
   const seen = new Map<string, Quote>();
 
   for (const r of rules) {
     const symbol = r.symbol.toUpperCase();
-    const tfs = parseTfs(r.timeframe);
+    // Tek zaman dilimi seçiliyse: bütün pariteler o TF'de; seçilmemişse her paritenin kendi TF'leri
+    const tfs = tfOnly ? (parseTfs(r.timeframe).includes(tfOnly) ? [tfOnly] : [tfOnly]) : parseTfs(r.timeframe);
     const cfg = ruleCfg(r);
     const existing = seen.get(symbol);
     if (existing) {
@@ -108,5 +121,5 @@ export async function buildMarket(userId: number, live: boolean) {
     }
   }
   radar.sort((a, b) => Number(!!b.signal) - Number(!!a.signal) || b.strength - a.strength || b.tags.length - a.tags.length);
-  return { quotes, radar };
+  return { quotes, radar, tf: tfOnly };
 }

@@ -10,7 +10,7 @@ import OrderTicket from "./OrderTicket";
 import type { KanalItem } from "@/lib/kanal";
 import {
   HudPanel, HudTitle, IconBrain, IconChart, IconGear, IconGlobe, IconMarket, IconPhone, IconPosition, IconPulse,
-  IconRadar, IconSignal, IconTrade, Ring, SymbolIcon, Spark, FlashNum,
+  IconRadar, IconSignal, IconTrade, Ring, SymbolIcon, Spark, FlashNum, TfBadge,
 } from "./hud";
 import { Badge, Button, Modal, Skeleton, api, cx, fmtNum, fmtPrice, timeAgo, useToast } from "./ui";
 import { CATEGORY_TABS, type Category } from "@/lib/tf";
@@ -27,7 +27,7 @@ export default function CommandCenter() {
   const toast = useToast();
   const [state, setState] = useState<StateT | null>(null);
   const [market, setMarket] = useState<MarketT | null>(null);
-  const [kanal, setKanal] = useState<{ items: KanalItem[]; live: boolean; watch: string[]; settings: { enabled: boolean; timeframes: string; params: { rsiOb: number; rsiOs: number; autoTrade?: boolean; autoMinConfidence?: number } } } | null>(null);
+  const [kanal, setKanal] = useState<{ items: KanalItem[]; live: boolean; watch: string[]; settings: { enabled: boolean; timeframes: string; params: { rsiOb: number; rsiOs: number }; auto?: { enabled: boolean; minConf: number; beAtPct: number } } } | null>(null);
   const [msgs, setMsgs] = useState<Msg[]>([]);
   const [mode, setMode] = useState<OrbMode>("idle");
   const [input, setInput] = useState("");
@@ -39,7 +39,34 @@ export default function CommandCenter() {
   const [chatOpen, setChatOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [orderOpen, setOrderOpen] = useState(false);
-  const [dismissed, setDismissed] = useState<Set<number>>(new Set());
+  const [dis, setDis] = useState<Record<string, string>>({});
+  useEffect(() => {
+    try { setDis(JSON.parse(localStorage.getItem("jarvis_dismiss") || "{}")); } catch {}
+  }, []);
+  /** Kapatılan uyarı, aynı içerikle (sig) tekrar çıkmaz; içerik değişirse yeniden görünür. */
+  const hide = useCallback((id: string, sig: string) => {
+    setDis((d) => {
+      const n = { ...d, [id]: sig };
+      try { localStorage.setItem("jarvis_dismiss", JSON.stringify(n)); } catch {}
+      return n;
+    });
+  }, []);
+  const shown = (id: string, sig: string) => dis[id] !== sig;
+  /* Bildirim bantları ilk görünmesinden 2 dk sonra kendiliğinden kapanır (aynı içerik tekrar çıkmaz). */
+  const visRef = useRef<{ id: string; sig: string }[]>([]);
+  const seenAt = useRef<Map<string, number>>(new Map());
+  useEffect(() => {
+    const iv = setInterval(() => {
+      const now = Date.now();
+      for (const v of visRef.current) {
+        const k = `${v.id}|${v.sig}`;
+        const t0 = seenAt.current.get(k);
+        if (t0 === undefined) seenAt.current.set(k, now);
+        else if (now - t0 >= 120000) hide(v.id, v.sig);
+      }
+    }, 5000);
+    return () => clearInterval(iv);
+  }, [hide]);
   const [now, setNow] = useState<Date | null>(null);
   const [orbSize, setOrbSize] = useState(470);
   const level = useRef(0);
@@ -48,6 +75,7 @@ export default function CommandCenter() {
   const recRef = useRef<SR>(null);
   const audioRef = useRef<{ ctx: AudioContext; stream: MediaStream; raf: number } | null>(null);
   const histEnd = useRef<HTMLDivElement>(null);
+  const selRef = useRef<string | null>(null);
   const voiceOnRef = useRef(voiceOn);
   voiceOnRef.current = voiceOn;
 
@@ -66,28 +94,23 @@ export default function CommandCenter() {
     try {
       const s = await api<StateT>("/api/state");
       setState(s);
+      // Otomatik açılan işlemleri duyur
+      const autos = s.recentSignals.filter((x) => x.source === "auto");
+      if (seenAuto.current === null) seenAuto.current = new Set(autos.map((x) => x.id));
+      else
+        for (const x of autos)
+          if (!seenAuto.current.has(x.id)) {
+            seenAuto.current.add(x.id);
+            if (x.status === "executed") toast(`🤖 Otomatik: ${x.symbol} ${x.timeframe} ${x.side === "BUY" ? "AL" : "SAT"} açıldı · güven %${x.confidence}`, "info");
+            else if (x.status === "failed") toast(`🤖 Otomatik ${x.symbol} emri gönderilemedi: ${x.note}`, "err");
+          }
       if (seenSignals.current === null) {
         seenSignals.current = new Set(s.pendingSignals.map((x) => x.id));
       } else {
-        const fresh = s.pendingSignals.filter((x) => !seenSignals.current!.has(x.id));
+        const fresh = s.pendingSignals.filter((x) => !seenSignals.current!.has(x.id) && x.source !== "manual");
+        s.pendingSignals.forEach((x) => seenSignals.current!.add(x.id));
         fresh.forEach((x) => seenSignals.current!.add(x.id));
         if (fresh[0]) announce(fresh[0]);
-      }
-      // Otomatik açılan KANAL işlemleri (ajan sormadan gönderdi) -> bildirim
-      const autos = s.recentSignals.filter((x) => (x.note ?? "").startsWith("OTOMATİK"));
-      if (seenAuto.current === null) {
-        seenAuto.current = new Set(autos.map((x) => x.id));
-      } else {
-        const fresh = autos.filter((x) => !seenAuto.current!.has(x.id));
-        fresh.forEach((x) => {
-          seenAuto.current!.add(x.id);
-          const ok = x.status === "executed";
-          const txt = ok
-            ? `${x.symbol} ${x.side === "BUY" ? "alış" : "satış"} işlemi otomatik açıldı efendim. Güven yüzde ${x.confidence}.`
-            : `${x.symbol} otomatik ${x.side === "BUY" ? "alış" : "satış"} emri gönderilemedi efendim.`;
-          toast(`${ok ? "⚡ Otomatik işlem" : "⚠ Otomatik işlem başarısız"}: ${x.symbol} ${x.side}`, ok ? "ok" : "err");
-          setMsgs((m) => [...m, { id: -Date.now() - x.id, role: "assistant", content: txt, createdAt: new Date().toISOString() }]);
-        });
       }
     } catch {}
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -95,14 +118,6 @@ export default function CommandCenter() {
   const loadMarket = useCallback(() => {
     api<MarketT>("/api/market").then(setMarket).catch(() => {});
     api<any>("/api/kanal").then(setKanal).catch(() => {});
-  }, []);
-
-  useEffect(() => {
-    if (new URLSearchParams(window.location.search).get("pw") === "default") {
-      window.history.replaceState(null, "", "/dashboard");
-      toast("Varsayılan demo şifresiyle giriş yaptınız. Panel ağa açıksa (lan modu) herkes bu şifreyi bilir — menüden 'Şifre değiştir' ile değiştirin.", "info");
-    }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -123,6 +138,7 @@ export default function CommandCenter() {
   }, [market, sel]);
 
   useEffect(() => { histEnd.current?.scrollIntoView({ block: "nearest" }); }, [msgs, chatOpen]);
+  useEffect(() => { setInfo(null); }, [sel?.symbol, sel?.tf]); // parite değişince eski fiyat başlıkta kalmasın
 
   /* ---------- TTS ---------- */
   const speak = useCallback((text: string, then?: () => void) => {
@@ -188,7 +204,7 @@ export default function CommandCenter() {
     setInput("");
     setMode("thinking");
     try {
-      const r = await api<{ reply: string; action: string | null; message: Msg }>("/api/chat", { body: { text: t } });
+      const r = await api<{ reply: string; action: string | null; message: Msg }>("/api/chat", { body: { text: t, context: { symbol: selRef.current } } });
       setMsgs((m) => [...m, r.message]);
       if (r.action) load();
       speak(r.reply);
@@ -267,13 +283,13 @@ export default function CommandCenter() {
   };
 
   const retrySignal = async (id: number) => {
-    setDismissed((d) => new Set(d).add(id));
+    hide(`fail:${id}`, "1");
     try {
       await api<Signal>(`/api/signals/${id}`, { method: "PATCH", body: { decision: "retry" } });
       toast("Emir ajana yeniden iletildi", "info");
       load();
     } catch (e) {
-      setDismissed((d) => { const n = new Set(d); n.delete(id); return n; });
+      hide(`fail:${id}`, "");
       toast((e as Error).message, "err");
     }
   };
@@ -291,6 +307,7 @@ export default function CommandCenter() {
   const activeTab: Category = tab ?? CATEGORY_TABS.find((t) => quotes.some((q) => q.category === t.key))?.key ?? "forex";
   const tabQuotes = quotes.filter((q) => q.category === activeTab);
   const selQuote = quotes.find((q) => q.symbol === sel?.symbol);
+  selRef.current = sel?.symbol ?? null;
   const radarActive = (market?.radar ?? []).filter((r) => r.signal || r.tags.length);
   const radarSignals = radarActive.filter((r) => r.signal).length;
   const lastAssistant = [...msgs].reverse().find((m) => m.role === "assistant");
@@ -362,35 +379,53 @@ export default function CommandCenter() {
           value={feed === "live" ? `canlı · ${tickAge!.toFixed(1)} sn` : feed === "slow" ? `gecikmeli · ${tickAge!.toFixed(0)} sn` : feed === "down" ? `DURDU · ${tickAge!.toFixed(0)} sn` : feed === "closed" ? "değişmiyor (piyasa kapalı?)" : feed === "none" ? "akış yok" : feed === "demo" ? "simüle" : "…"} />
         {ag?.online && <Chip tone={ag.algo ? "g" : "r"} label="Algo Trading" value={ag.algo ? "AÇIK" : "KAPALI"} />}
         {ag?.online && <Chip tone={ag.outdated || !ag.version ? "a" : "g"} label="Ajan" value={ag.version ? `v${ag.version}${ag.outdated ? " · güncelle" : ""}` : "eski sürüm"} />}
+        {kanal?.settings.auto && (
+          <Link href="/kanal"><Chip tone={kanal.settings.auto.enabled ? "a" : "n"} label="🤖 Oto-işlem" value={kanal.settings.auto.enabled ? `AÇIK · güven ≥%${kanal.settings.auto.minConf}` : "kapalı (sorar)"} /></Link>
+        )}
         <span className="ml-auto flex gap-2">
           <button onClick={() => setOrderOpen(true)} className="rounded-lg border border-cyan-400/50 bg-cyan-400/15 px-3 py-1 font-bold tracking-wide text-cyan-100 hover:bg-cyan-400/25">＋ Hızlı Emir</button>
         </span>
       </div>
-      {ag?.online && !ag.algo && (
-        <Banner tone="r" title="MT5'te Algo Trading KAPALI — emir gönderilemez">
-          MT5 üst çubuğundaki <b>Algo Trading</b> düğmesini yeşil yapın; ayrıca Araçlar → Seçenekler → Uzman Danışmanlar → <b>“Algoritmik ticarete izin ver”</b> kutusunu işaretleyin.
-        </Banner>
-      )}
-      {ag?.online && !ag.tradeAllowed && (
-        <Banner tone="r" title="Bu hesapta işlem izni yok">Hesaba salt-okunur (yatırımcı) şifresiyle girilmiş ya da broker algoritmik işleme izin vermiyor olabilir.</Banner>
-      )}
-      {(state?.failedSignals ?? []).filter((f) => !dismissed.has(f.id)).map((f) => (
-        <Banner key={f.id} tone="r" title={`${f.symbol} ${f.side} emri gönderilemedi`} action={<button onClick={() => retrySignal(f.id)} className="rounded-md border border-rose-300/50 px-2 py-1 text-xs font-bold hover:bg-rose-400/20">↻ Tekrar dene</button>} onClose={() => setDismissed((d) => new Set(d).add(f.id))}>
-          {f.note || "Neden bildirilmedi."}
-        </Banner>
-      ))}
-      {ag?.online && ag.ticks === 0 && (
-        <Banner tone="a" title="Canlı fiyat akışı gelmiyor">Ajan eski sürüm olabilir (v2.8 gerekli) ya da izleme listeniz boş. <Link href="/agent" className="underline">Yerel Ajan</Link> sayfasındaki güncelleme adımlarına bakın.</Banner>
-      )}
-      {ag?.online && ag.outdated && (
-        <Banner tone="a" title={`Ajan güncel değil (v${ag.version} → v${ag.latest})`}><b>CALISTIR.bat</b> ile açarsanız ajan kendini otomatik günceller. EXE kullanıyorsanız <Link href="/agent" className="underline">güncelleme paketini</Link> indirin.</Banner>
-      )}
-      {ag?.online && feedErrs.length > 0 && (
-        <Banner tone="a" title={`${feedErrs.length} sembol/zaman diliminde veri alınamadı`}>
-          {feedErrs.slice(0, 4).map(([k, v]) => <div key={k} className="num text-[11px]">{k}: {v}</div>)}
-          <div className="mt-1 text-[11px] opacity-80">Sembol adı brokerda farklı olabilir (örn. EURUSD.m) — ajan eklerini otomatik dener; yine de olmuyorsa MT5 Piyasa Gözlemi&apos;nde sembolün var olduğunu kontrol edin.</div>
-        </Banner>
-      )}
+      {(() => {
+        const today = new Date().toDateString();
+        const feedSig = feedErrs.map(([k]) => k).sort().join("|");
+        const items: { id: string; sig: string; el: React.ReactNode }[] = [];
+        if (ag?.online && !ag.algo)
+          items.push({ id: "algo", sig: today, el: (
+            <Banner tone="r" title="MT5'te Algo Trading KAPALI — emir gönderilemez" onClose={() => hide("algo", today)}>
+              MT5 üst çubuğundaki <b>Algo Trading</b> düğmesini yeşil yapın; ayrıca Araçlar → Seçenekler → Uzman Danışmanlar → <b>“Algoritmik ticarete izin ver”</b> kutusunu işaretleyin.
+            </Banner>) });
+        if (ag?.online && !ag.tradeAllowed)
+          items.push({ id: "trade", sig: today, el: <Banner tone="r" title="Bu hesapta işlem izni yok" onClose={() => hide("trade", today)}>Hesaba salt-okunur (yatırımcı) şifresiyle girilmiş ya da broker algoritmik işleme izin vermiyor olabilir.</Banner> });
+        for (const f of state?.failedSignals ?? [])
+          items.push({ id: `fail:${f.id}`, sig: "1", el: (
+            <Banner tone="r" title={`${f.symbol} ${f.side} emri gönderilemedi`} action={<button onClick={() => retrySignal(f.id)} className="rounded-md border border-rose-300/50 px-2 py-1 text-xs font-bold hover:bg-rose-400/20">↻ Tekrar dene</button>} onClose={() => hide(`fail:${f.id}`, "1")}>
+              {f.note || "Neden bildirilmedi."}
+            </Banner>) });
+        if (ag?.online && ag.ticks === 0)
+          items.push({ id: "noticks", sig: today, el: <Banner tone="a" title="Canlı fiyat akışı gelmiyor" onClose={() => hide("noticks", today)}>Ajan eski sürüm olabilir ya da izleme listeniz boş. <Link href="/agent" className="underline">Yerel Ajan</Link> sayfasındaki güncelleme adımlarına bakın.</Banner> });
+        if (ag?.online && ag.outdated)
+          items.push({ id: "outdated", sig: ag.version ?? "", el: <Banner tone="a" title={`Ajan güncel değil (v${ag.version} → v${ag.latest})`} onClose={() => hide("outdated", ag.version ?? "")}><b>CALISTIR.bat</b> ile açarsanız ajan kendini otomatik günceller. SL/TP değiştirme ve sohbet emirleri için v{ag.latest} gerekir.</Banner> });
+        if (ag?.online && feedErrs.length > 0)
+          items.push({ id: "feed", sig: feedSig, el: (
+            <Banner tone="a" title={`${feedErrs.length} sembol/zaman diliminde veri alınamadı`} onClose={() => hide("feed", feedSig)}>
+              {feedErrs.slice(0, 4).map(([k, v]) => <div key={k} className="num text-[11px]">{k}: {v}</div>)}
+              <div className="mt-1 text-[11px] opacity-80">Ajan v2.9 brokerdaki adları otomatik eşler (US100 → NAS100, US30 → DJ30, XAUUSD → GOLD, EURUSD → EURUSD.m). Hâlâ görünüyorsa <Link href="/rules" className="underline">İzleme Kuralları</Link>&apos;nda sembolü brokerdaki adıyla değiştirin.</div>
+            </Banner>) });
+        const vis = items.filter((i) => shown(i.id, i.sig));
+        visRef.current = vis.map((i) => ({ id: i.id, sig: i.sig }));
+        return (
+          <>
+            {vis.map((i) => <div key={i.id}>{i.el}</div>)}
+            {vis.length > 1 && (
+              <div className="mt-1 text-right">
+                <span className="mr-3 text-[10px] text-slate-500">uyarılar 2 dk sonra kendiliğinden kapanır</span>
+                <button onClick={() => vis.forEach((i) => hide(i.id, i.sig))} className="text-[11px] font-bold text-slate-400 hover:text-cyan-200">✕ Tüm uyarıları gizle</button>
+              </div>
+            )}
+          </>
+        );
+      })()}
 
       <div className="mt-4 grid gap-4 xl:grid-cols-[minmax(340px,1fr)_minmax(440px,1.22fr)_minmax(340px,1fr)]">
         {/* ================= SOL ================= */}
@@ -478,10 +513,10 @@ export default function CommandCenter() {
               <div className="py-5 text-center text-sm text-slate-400">Açık pozisyon yok. Onayladığınız sinyaller burada görünür.</div>
             ) : (
               <div className="scroll-thin overflow-x-auto">
-                <table className="w-full min-w-[420px] text-[12px]">
+                <table className="w-full min-w-[470px] text-[12px]">
                   <thead>
                     <tr className="text-left text-[10px] text-slate-400">
-                      <th className="pb-1 font-semibold">Sembol</th><th className="font-semibold">Yön</th><th className="font-semibold">Lot</th>
+                      <th className="pb-1 font-semibold">Sembol</th><th className="font-semibold">TF</th><th className="font-semibold">Yön</th><th className="font-semibold">Lot</th>
                       <th className="text-right font-semibold">Giriş</th><th className="text-right font-semibold">Güncel</th>
                       <th className="text-right font-semibold">SL</th><th className="text-right font-semibold">TP</th><th className="text-right font-semibold">P/L</th>
                     </tr>
@@ -490,6 +525,7 @@ export default function CommandCenter() {
                     {state.openTrades.slice(0, 6).map((t) => (
                       <tr key={t.id} className="hud-row cursor-pointer" onClick={() => market?.quotes.some((q) => q.symbol === t.symbol) && setSel({ symbol: t.symbol, tf: market.quotes.find((q) => q.symbol === t.symbol)!.tfs[0] })}>
                         <td className="py-[5px] font-bold text-white" style={{ fontFamily: "Rajdhani" }}>{t.symbol}</td>
+                        <td><TfBadge tf={t.timeframe} comment={t.comment} /></td>
                         <td className={cx("font-extrabold", t.side === "BUY" ? "text-emerald-300" : "text-rose-300")}>{t.side}</td>
                         <td>{t.volume.toFixed(2)}</td>
                         <td className="text-right">{fmtPrice(t.openPrice)}</td>
@@ -562,8 +598,13 @@ export default function CommandCenter() {
                     <span className="text-xs text-slate-400">{timeAgo(pending.createdAt)}</span>
                   </div>
                   <div className="mt-1.5 text-lg font-semibold text-slate-100">
-                    <span className="num">{pending.symbol}</span> paritesinde{" "}
-                    <span className={pending.side === "BUY" ? "text-emerald-300" : "text-rose-300"}>{pending.side}</span> fırsatı oluştu, işleme gireyim mi?
+                    {pending.source === "manual" ? (
+                      <>Emriniz: <span className="num">{pending.symbol}</span>{" "}
+                      <span className={pending.side === "BUY" ? "text-emerald-300" : "text-rose-300"}>{pending.side === "BUY" ? "AL" : "SAT"}</span> {pending.volume} lot — gönderilsin mi?</>
+                    ) : (
+                      <><span className="num">{pending.symbol}</span> paritesinde{" "}
+                      <span className={pending.side === "BUY" ? "text-emerald-300" : "text-rose-300"}>{pending.side}</span> fırsatı oluştu, işleme gireyim mi?</>
+                    )}
                   </div>
                   <div className="mt-1 text-sm text-slate-400">{pending.reason} · {pending.volume} lot @ {fmtPrice(pending.price)} · Güven %{pending.confidence}</div>
                   <div className="mt-3 flex gap-2">
@@ -588,7 +629,7 @@ export default function CommandCenter() {
             </div>
             <form className="flex gap-2" onSubmit={(e) => { e.preventDefault(); send(input); }}>
               <button type="button" onClick={listen} className={cx("flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border", mode === "listening" ? "border-emerald-400 bg-emerald-400/20" : "border-cyan-400/40 hover:bg-cyan-400/10")}>🎙</button>
-              <input className="input !py-1.5" placeholder="JARVIS'e yazın…" value={input} onChange={(e) => setInput(e.target.value)} />
+              <input className="input !py-1.5" placeholder="örn: EURUSD 0.1 lot al sl 30 tp 60 · SL girişe çek · NAS100 kapat" value={input} onChange={(e) => setInput(e.target.value)} />
               <Button type="submit" size="sm" disabled={!input.trim() || mode === "thinking"}>Gönder</Button>
             </form>
           </HudPanel>
@@ -783,15 +824,14 @@ export default function CommandCenter() {
         <HudTitle icon={<IconSignal />} right={
           <span className="flex items-center gap-3 text-[11px] font-bold">
             {kanal && <Badge tone={kanal.settings.enabled ? "green" : "slate"}>{kanal.settings.enabled ? "AÇIK" : "KAPALI"}</Badge>}
-            {kanal?.settings.params.autoTrade && <Badge tone="amber">⚡ OTOMATİK ≥ %{kanal.settings.params.autoMinConfidence ?? 80}</Badge>}
             {kanal && <Badge tone="cyan">{kanal.watch.length} parite · {kanal.settings.timeframes}</Badge>}
             {kanal && kanal.items.some((i) => i.fire) && <Badge tone="amber">{kanal.items.filter((i) => i.fire).length} yeni sinyal</Badge>}
             <Link href="/kanal" className="text-cyan-400 hover:underline">ayarlar / tüm tarama →</Link>
           </span>
         }>KANAL Strateji — Piyasa Gözlemi</HudTitle>
-        {!kanal ? <Skeleton rows={3} /> : <KanalTable items={kanal.items} onlyActive limit={8} rsiOb={kanal.settings.params.rsiOb} rsiOs={kanal.settings.params.rsiOs} autoMin={kanal.settings.params.autoMinConfidence} onSelect={(symbol) => { const q = quotes.find((x) => x.symbol === symbol); if (q) setSel({ symbol, tf: q.tfs[0] }); }} />}
+        {!kanal ? <Skeleton rows={3} /> : <KanalTable items={kanal.items} onlyActive limit={8} rsiOb={kanal.settings.params.rsiOb} rsiOs={kanal.settings.params.rsiOs} minConf={kanal.settings.auto?.minConf} autoOn={kanal.settings.auto?.enabled} onSelect={(symbol) => { const q = quotes.find((x) => x.symbol === symbol); if (q) setSel({ symbol, tf: q.tfs[0] }); }} />}
         <p className="mt-2 text-[11px] text-slate-500">
-          Üst/alt bandı kırıp içeri kapanan, ardından CCI mor çizgiyi (MA) kesen ve RSI şartını sağlayan pariteler (sıra + yön onayıyla). 5/5 olunca JARVIS sesli onay ister; Otomatik İşlem açıksa güven eşiğini geçenler (⚡) sorulmadan gönderilir.
+          Tüm bantların dışında kapanış yapıp içeri dönen, RSI 30/70 ve CCI mor çizgi kesişimi veren pariteler (takip listesi · 3dk/5dk/15dk/1sa). 5/5 olunca: {kanal?.settings.auto?.enabled ? `güven ≥ %${kanal.settings.auto.minConf} ise JARVIS otomatik girer, altındaysa sorar` : "JARVIS sesli onay ister, “Evet” demeden işlem açılmaz"}.
         </p>
       </HudPanel>
 

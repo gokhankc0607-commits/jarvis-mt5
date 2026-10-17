@@ -146,3 +146,18 @@ export function FlashNum({ value, children, className }: { value: number | null 
   }, [value]);
   return <span key={dir === 0 ? "n" : value} className={cx(className, dir === 1 && "flash-up", dir === -1 && "flash-down")}>{children}</span>;
 }
+
+/** İşlemin açıldığı zaman dilimi rozeti (MAN = elle emir, boş = MT5'te elle açılmış). */
+export function TfBadge({ tf, comment, onClick }: { tf?: string | null; comment?: string | null; onClick?: () => void }) {
+  const label = !tf ? (onClick ? "＋TF" : "—") : tf === "MAN" ? "Elle" : tf;
+  const title =
+    (!tf ? "Zaman dilimi bilinmiyor — MT5'te elle ya da başka bir EA ile açılmış olabilir." + (onClick ? " Tıklayıp elle atayabilirsiniz." : "")
+      : tf === "MAN" ? "Elle verilen emir (sohbet / Hızlı Emir)" : `${tf} zaman diliminde açıldı`) + (comment ? `\nMT5 yorumu: ${comment}` : "");
+  const Tag = onClick ? "button" : "span";
+  return (
+    <Tag title={title} onClick={onClick} className={cx("inline-flex min-w-[38px] justify-center rounded-md border px-1.5 py-0.5 text-[10px] font-black tracking-wider", onClick && "cursor-pointer hover:brightness-125",
+      !tf ? "border-slate-600/40 text-slate-500" : tf === "MAN" ? "border-violet-400/40 bg-violet-400/10 text-violet-200" : "border-cyan-400/40 bg-cyan-400/10 text-cyan-200")}>
+      {label}
+    </Tag>
+  );
+}

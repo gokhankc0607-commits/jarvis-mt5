@@ -279,9 +279,9 @@ Result: 1 errors, 0 warnings`,
   ]);
 
   await db.insert(trades).values([
-    { userId, ticket: "100482211", symbol: "EURUSD", side: "SELL", volume: 0.1, openPrice: 1.08742, currentPrice: 1.08611, sl: 1.09042, tp: 1.08142, pnl: 131, comment: "JARVIS SELL", openedAt: min(94) },
-    { userId, ticket: "100482574", symbol: "XAUUSD", side: "BUY", volume: 0.05, openPrice: 2371.1, currentPrice: 2384.52, sl: 2356, tp: 2401, pnl: 67.1, comment: "JARVIS BUY", openedAt: min(180) },
-    { userId, ticket: "100481930", symbol: "US30", side: "BUY", volume: 0.2, openPrice: 39120, currentPrice: 39221.5, pnl: 20.3, comment: "manuel", openedAt: min(300) },
+    { userId, ticket: "100482211", symbol: "EURUSD", side: "SELL", volume: 0.1, openPrice: 1.08742, currentPrice: 1.08611, sl: 1.09042, tp: 1.08142, pnl: 131, comment: "JARVIS SELL H1", timeframe: "H1", openedAt: min(94) },
+    { userId, ticket: "100482574", symbol: "XAUUSD", side: "BUY", volume: 0.05, openPrice: 2371.1, currentPrice: 2384.52, sl: 2356, tp: 2401, pnl: 67.1, comment: "JARVIS AUTO M15", timeframe: "M15", openedAt: min(180) },
+    { userId, ticket: "100481930", symbol: "US30", side: "BUY", volume: 0.2, openPrice: 39120, currentPrice: 39221.5, pnl: 20.3, comment: "manuel", timeframe: "MAN", openedAt: min(300) },
     { userId, ticket: "100479002", symbol: "GBPUSD", side: "BUY", volume: 0.1, openPrice: 1.2701, currentPrice: 1.2754, pnl: 53, status: "closed", comment: "JARVIS BUY", openedAt: min(1440), closedAt: min(1200) },
     { userId, ticket: "100478100", symbol: "XAUUSD", side: "BUY", volume: 0.05, openPrice: 2351.2, currentPrice: 2366.9, pnl: 78.5, status: "closed", comment: "JARVIS BUY", openedAt: min(4300), closedAt: min(4100) },
     { userId, ticket: "100477650", symbol: "EURUSD", side: "SELL", volume: 0.1, openPrice: 1.0912, currentPrice: 1.0861, pnl: 51, status: "closed", comment: "JARVIS SELL", openedAt: min(7200), closedAt: min(6900) },

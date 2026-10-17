@@ -12,7 +12,9 @@ MT5 olmayan ortamlarda (Linux/Mac test) `simulate=True` ile rastgele yürüyüş
 """
 from __future__ import annotations
 
+import difflib
 import functools
+import re
 import logging
 import math
 import random
@@ -32,7 +34,7 @@ except Exception:  # pragma: no cover
 log = logging.getLogger("jarvis.mt5")
 
 TIMEFRAMES = {
-    "M1": 1, "M5": 5, "M15": 15, "M30": 30, "H1": 60, "H4": 240, "D1": 1440,
+    "M1": 1, "M3": 3, "M5": 5, "M15": 15, "M30": 30, "H1": 60, "H4": 240, "D1": 1440,
 }
 
 
@@ -54,9 +56,52 @@ RETCODES = {
     10016: "Geçersiz SL/TP (fiyata çok yakın ya da yanlış tarafta)", 10017: "Bu sembolde işlem kapalı",
     10018: "Piyasa kapalı", 10019: "Yetersiz teminat", 10020: "Fiyat değişti", 10021: "Fiyat akışı yok",
     10024: "Çok sık istek gönderildi", 10027: ALGO_HINT, 10028: "Sunucu tarafında algoritmik işlem kapalı",
-    10030: "Doldurma modu desteklenmiyor", 10031: "Sunucuya bağlantı yok", 10033: "Bekleyen emir limiti doldu",
+    10025: "Değişiklik yok (SL/TP zaten bu değerde)", 10030: "Doldurma modu desteklenmiyor", 10031: "Sunucuya bağlantı yok", 10033: "Bekleyen emir limiti doldu",
     10034: "Lot limiti doldu", 10040: "Açık pozisyon sayısı limiti doldu",
 }
+
+
+# Brokerlar aynı enstrümana farklı ad verir (US100 = NAS100 = USTEC ...). İlk ad paneldeki standart addır.
+SYMBOL_GROUPS: list[list[str]] = [
+    ["US100", "NAS100", "USTEC", "NDX100", "NQ100", "NASDAQ100", "NASDAQ", "USTECH", "US100CASH", "NAS100CASH", "NDX"],
+    ["US30", "DJ30", "DOW30", "WS30", "DJI30", "DOWJONES", "US30CASH", "DJ30CASH", "DJI", "DOW"],
+    ["US500", "SPX500", "SP500", "US500CASH", "SPX"],
+    ["GER40", "DE40", "DAX40", "GER30", "DE30", "DAX", "GERMANY40", "GER40CASH"],
+    ["UK100", "FTSE100", "UK100CASH", "FTSE"],
+    ["JP225", "JPN225", "NIKKEI225", "NIK225", "JAPAN225"],
+    ["FRA40", "CAC40", "FRANCE40"],
+    ["EU50", "EUSTX50", "STOXX50", "ESTX50"],
+    ["AUS200", "ASX200", "AU200"],
+    ["HK50", "HSI50", "HONGKONG50"],
+    ["XAUUSD", "GOLD", "GOLDUSD"],
+    ["XAGUSD", "SILVER"],
+    ["USOIL", "WTI", "XTIUSD", "USOUSD", "OILUSD", "CRUDEOIL"],
+    ["UKOIL", "BRENT", "XBRUSD", "UKOUSD"],
+    ["BTCUSD", "BITCOIN", "BTCUSDT", "XBTUSD"],
+    ["ETHUSD", "ETHEREUM", "ETHUSDT"],
+]
+
+
+def _norm(s: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", s.upper())
+
+
+def symbol_aliases(name: str) -> list[str]:
+    """name ile aynı enstrümanın bilinen tüm adları (kendisi ilk sırada)."""
+    n = _norm(name)
+    for g in SYMBOL_GROUPS:
+        if any(n == _norm(a) for a in g):
+            return [name] + [a for a in g if _norm(a) != n]
+    return [name]
+
+
+_TF_PARSE = re.compile(r"(?<![A-Z0-9])(?:PERIOD_)?(M1|M3|M5|M15|M30|H1|H4|D1|MAN)(?![A-Z0-9])")
+
+
+def parse_tf(comment: str) -> str:
+    """Emir yorumundan zaman dilimi: 'JARVIS AUTO M15', 'JARVIS BUY M5 #12', 'KANAL BUY PERIOD_M15' -> M15."""
+    m = _TF_PARSE.search((comment or "").upper())
+    return m.group(1) if m else ""
 
 
 def describe_retcode(code: int | None, comment: str = "") -> str:
@@ -100,6 +145,7 @@ class Position:
     pnl: float
     comment: str = ""
     magic: int = 0
+    tf: str = ""  # işlemin açıldığı zaman dilimi (ajan kaydı / yorum)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -151,6 +197,7 @@ class OrderResult:
     price: Optional[float] = None
     retcode: Optional[int] = None
     message: str = ""
+    position: Optional[int] = None  # açılan pozisyonun bileti (MT5 position ticket)
 
 
 # --------------------------------------------------------------------------- #
@@ -226,8 +273,11 @@ def pip_size(symbol: str, point: float | None = None, digits: int | None = None)
         return 0.01
     if s.startswith("XAU"):
         return 0.1
-    if s.startswith(("US30", "NAS", "SPX", "GER", "UK100")):
+    if s.startswith(("US30", "US100", "US500", "USTEC", "NAS", "NDX", "SPX", "SP500", "DJ", "DOW", "WS30", "GER", "DE40",
+                     "DE30", "DAX", "UK100", "FTSE", "JP225", "JPN225", "NIK", "FRA40", "EU50", "AUS200", "HK50")):
         return 1.0
+    if s.startswith("GOLD"):
+        return 0.1
     if point and digits in (3, 5):
         return point * 10
     return 0.0001
@@ -264,6 +314,7 @@ class MT5Engine:
         self._spec_cache: dict[str, tuple[float, dict]] = {}
         self._rates_cache: dict[tuple[str, str], tuple[float, Any]] = {}
         self._last_px: dict[str, tuple[float, float]] = {}
+        self._sim_partial: set[int] = set()
         if mt5 is None and not simulate:
             log.warning("MetaTrader5 paketi bulunamadı -> SİMÜLASYON modunda çalışılıyor (pip install MetaTrader5, yalnız Windows).")
 
@@ -329,9 +380,7 @@ class MT5Engine:
         )
 
     @_locked
-    def positions(self, strict: bool = False) -> Optional[list[Position]]:
-        """Açık pozisyonlar. strict=True: MT5 API hata verirse (positions_get() None) [] yerine None döner —
-        böylece geçici bir API hatası paneldeki tüm açık işlemlerin 'kapandı' sanılmasına yol açmaz."""
+    def positions(self) -> list[Position]:
         if self.simulate:
             for p in self._sim_positions:
                 p.currentPrice = self._sim_tick(p.symbol)
@@ -339,13 +388,9 @@ class MT5Engine:
                 p.pnl = round(diff * p.volume * self._contract(p.symbol), 2)
             return list(self._sim_positions)
         if not self.ensure_connected():
-            return None if strict else []
-        raw = mt5.positions_get()
-        if raw is None:
-            log.warning("positions_get() başarısız: %s", mt5.last_error())
-            return None if strict else []
+            return []
         out: list[Position] = []
-        for p in raw:
+        for p in mt5.positions_get() or []:
             out.append(Position(
                 ticket=p.ticket, symbol=p.symbol, side="BUY" if p.type == mt5.POSITION_TYPE_BUY else "SELL",
                 volume=p.volume, openPrice=p.price_open, currentPrice=p.price_current, sl=p.sl, tp=p.tp,
@@ -356,27 +401,49 @@ class MT5Engine:
     # ------------------------------------------------------------------ sembol / veri
     @_locked
     def resolve_symbol(self, name: str) -> str:
-        """Panel adı (EURUSD) -> brokerdaki gerçek ad (EURUSD.m, EURUSDm, EURUSD# ...)."""
+        """Panel adı -> brokerdaki gerçek ad. Ekler (EURUSD.m, EURUSDm, NAS100.cash) ve takma adlar
+        (US100 -> NAS100/USTEC, US30 -> DJ30/WS30, XAUUSD -> GOLD ...) otomatik denenir."""
         if self.simulate or mt5 is None:
             return name
         key = name.upper()
         hit = self._sym_cache.get(key)
         if hit and (hit[0] != name or time.time() - hit[1] < 60):
             return hit[0]
-        if mt5.symbol_info(name) is not None:
-            self._sym_cache[key] = (name, time.time())
-            return name
-        cands = []
-        for sy in mt5.symbols_get() or []:
-            n = sy.name.upper()
-            if n.startswith(key) or n.endswith(key) or (key in n and len(n) <= len(key) + 4):
-                cands.append(sy.name)
-        cands.sort(key=lambda x: (len(x), x))
-        res = cands[0] if cands else name
+        res = name if mt5.symbol_info(name) is not None else None
+        if res is None:
+            all_syms = mt5.symbols_get() or []
+            by_norm: dict[str, list] = {}
+            for sy in all_syms:
+                by_norm.setdefault(_norm(sy.name), []).append(sy)
+
+            def pick(cands: list) -> str:
+                cands.sort(key=lambda x: (not getattr(x, "select", False), len(x.name), x.name))  # Piyasa Gözlemi'ndekiler önce
+                return cands[0].name
+
+            for alias in symbol_aliases(name):
+                na = _norm(alias)
+                if na in by_norm:  # birebir (noktalama hariç)
+                    res = pick(list(by_norm[na]))
+                    break
+                if len(na) >= 4:  # ek: NAS100 -> NAS100.cash / NAS100m
+                    c = [sy for k, lst in by_norm.items() if k.startswith(na) and len(k) - len(na) <= 5 for sy in lst]
+                    if c:
+                        res = pick(c)
+                        break
+        res = res or name
         self._sym_cache[key] = (res, time.time())
         if res != name:
             log.info("Sembol eşlendi: %s -> %s", name, res)
         return res
+
+    @_locked
+    def suggest_symbols(self, name: str, n: int = 3) -> list[str]:
+        if self.simulate or mt5 is None:
+            return []
+        names = [sy.name for sy in (mt5.symbols_get() or [])]
+        normed = {_norm(x): x for x in names}
+        hits = difflib.get_close_matches(_norm(name), list(normed), n=n, cutoff=0.5)
+        return [normed[h] for h in hits]
 
     def _spec(self, sym: str) -> dict:
         hit = self._spec_cache.get(sym)
@@ -438,7 +505,8 @@ class MT5Engine:
                     stale = 0.0
                 else:
                     stale = now - prev[1]
-                out.append({"s": name, "bid": bid, "ask": ask, "t": ts, "stale": round(stale, 1), **spec})
+                real = name if self.simulate else self.resolve_symbol(name)
+                out.append({"s": name, "real": real, "bid": bid, "ask": ask, "t": ts, "stale": round(stale, 1), **spec})
             except Exception as e:  # noqa: BLE001
                 log.debug("quote %s: %s", name, e)
         return out
@@ -461,6 +529,9 @@ class MT5Engine:
             time.sleep(0.4)
             data = mt5.copy_rates_from_pos(sym, tf, 0, count)
         if data is None or len(data) == 0:
+            if mt5.symbol_info(sym) is None:
+                sug = self.suggest_symbols(symbol)
+                raise RuntimeError(f"{symbol} brokerda bulunamadı" + (f" — benzer: {', '.join(sug)}" if sug else " — Piyasa Gözlemi'nde var mı?"))
             raise RuntimeError(f"{symbol}{'' if sym == symbol else ' (' + sym + ')'} {timeframe} verisi alınamadı: {mt5.last_error()}")
         df = pd.DataFrame(data)
         df["time"] = pd.to_datetime(df["time"], unit="s")
@@ -487,29 +558,6 @@ class MT5Engine:
             for t, o, h, l, c, v in zip(df["time"], df["open"], df["high"], df["low"], df["close"], df["tick_volume"])
         ]
         return {"symbol": symbol, "timeframe": timeframe, "bid": bid, "ask": ask, "candles": candles}
-
-    @_locked
-    def find_by_comment(self, comment: str, lookback_sec: int = 6 * 3600) -> Optional[int]:
-        """Bu yorumla (örn. 'JARVIS BUY #42') açılmış bir pozisyon ya da son saatlerde bir işlem var mı?
-        Mükerrer emir koruması: rapor panele ulaşmadan ajan yeniden başlarsa aynı sinyal ikinci kez gönderilmez."""
-        if self.simulate:
-            for p in self._sim_positions:
-                if p.comment == comment:
-                    return p.ticket
-            return None
-        if mt5 is None or not self.ensure_connected():
-            return None
-        try:
-            for p in mt5.positions_get() or []:
-                if p.magic == self.magic and (p.comment or "").strip() == comment:
-                    return int(p.ticket)
-            now = time.time()
-            for d in mt5.history_deals_get(now - lookback_sec, now + 60) or []:
-                if d.magic == self.magic and (d.comment or "").strip() == comment:
-                    return int(d.position_id or d.order or d.ticket)
-        except Exception as e:  # noqa: BLE001
-            log.debug("find_by_comment: %s", e)
-        return None
 
     @_locked
     def deal_summary(self, ticket: int) -> Optional[dict]:
@@ -601,7 +649,7 @@ class MT5Engine:
     @_locked
     def place_order(self, symbol: str, side: str, volume: float, sl: float | None = None,
                     tp: float | None = None, comment: str = "JARVIS", approved: bool = False,
-                    signal_price: float | None = None, max_dev_pct: float = 1.5) -> OrderResult:
+                    signal_price: float | None = None, max_dev_pct: float = 1.5, magic: int | None = None) -> OrderResult:
         """Piyasa emri. `approved=True` zorunludur — kullanıcı onayı olmadan emir gönderilmez.
 
         Gönderimden ÖNCE: Algo Trading / hesap izni, sembol işlem modu, güncel fiyat, sinyal fiyatının bayatlığı,
@@ -617,10 +665,11 @@ class MT5Engine:
             bid, ask = self.tick(symbol)
             price = ask if is_buy else bid
             t = random.randint(10_000_000, 99_999_999)
-            self._sim_positions.append(Position(t, symbol, side, volume, price, price, sl or 0, tp or 0, 0.0, comment, self.magic))
-            return OrderResult(True, t, price, 10009, "SIM DONE")
+            self._sim_positions.append(Position(t, symbol, side, volume, price, price, sl or 0, tp or 0, 0.0, comment, magic or self.magic))
+            return OrderResult(True, t, price, 10009, "SIM DONE", position=t)
         if not self.ensure_connected():
             return OrderResult(False, retcode=10031, message="MT5 terminaline bağlı değil.")
+        use_magic = int(magic or self.magic)
 
         ti, ai = mt5.terminal_info(), mt5.account_info()
         if ti is not None and not ti.trade_allowed:
@@ -698,7 +747,7 @@ class MT5Engine:
             for fill in fills:
                 req = {
                     "action": mt5.TRADE_ACTION_DEAL, "symbol": sym, "volume": float(vol), "type": otype, "price": open_px,
-                    "sl": sl_f, "tp": tp_f, "deviation": dev_pts, "magic": self.magic, "comment": comment[:31],
+                    "sl": sl_f, "tp": tp_f, "deviation": dev_pts, "magic": use_magic, "comment": comment[:31],
                     "type_time": mt5.ORDER_TIME_GTC, "type_filling": fill,
                 }
                 chk = mt5.order_check(req)
@@ -719,7 +768,18 @@ class MT5Engine:
                     continue
                 if res.retcode in (10009, 10008, 10010):
                     msg = "Emir gerçekleşti" + (f" · SL {sl_f} TP {tp_f}" if (sl_f or tp_f) else "") + (" · " + " | ".join(notes) if notes else "")
-                    return OrderResult(True, res.order or res.deal, res.price, res.retcode, msg)
+                    pos_id = None
+                    try:  # açılan pozisyonun gerçek bileti (genelde emir biletiyle aynıdır)
+                        if res.deal:
+                            for _ in range(3):
+                                dd = mt5.history_deals_get(ticket=res.deal)
+                                if dd:
+                                    pos_id = int(dd[0].position_id)
+                                    break
+                                time.sleep(0.1)
+                    except Exception:  # noqa: BLE001
+                        pos_id = None
+                    return OrderResult(True, res.order or res.deal, res.price, res.retcode, msg, position=pos_id or res.order or None)
                 if res.retcode == 10030:
                     continue
                 if res.retcode in (10004, 10020, 10021, 10016):
@@ -733,15 +793,17 @@ class MT5Engine:
         return last
 
     @_locked
-    def modify_position(self, ticket: int, sl: float | None, tp: float | None) -> OrderResult:
-        """Açık pozisyonun SL/TP'sini değiştir (TRADE_ACTION_SLTP). Breakeven için kullanılır.
-        SL güncel fiyata stops/freeze mesafesinden yakınsa gönderilmez (retcode 10016 ile döner; sonra tekrar denenir)."""
+    def modify_position(self, ticket: int, sl: float | None = None, tp: float | None = None) -> OrderResult:
+        """Açık pozisyonun SL/TP'sini değiştirir (TRADE_ACTION_SLTP). None = değiştirme, 0 = kaldır.
+        Yön ve minimum stop mesafesi (stops/freeze level) kontrol edilir; anlaşılır hata döner."""
         if self.simulate:
             for p in self._sim_positions:
                 if p.ticket == int(ticket):
-                    p.sl = float(sl or 0.0)
-                    p.tp = float(tp or p.tp or 0.0)
-                    return OrderResult(True, p.ticket, p.currentPrice, 10009, "SIM MODIFIED")
+                    if sl is not None:
+                        p.sl = float(sl)
+                    if tp is not None:
+                        p.tp = float(tp)
+                    return OrderResult(True, p.ticket, p.currentPrice, 10009, f"SL {p.sl} TP {p.tp}")
             return OrderResult(False, message="pozisyon yok")
         if not self.ensure_connected():
             return OrderResult(False, retcode=10031, message="MT5 terminaline bağlı değil.")
@@ -750,29 +812,106 @@ class MT5Engine:
             return OrderResult(False, retcode=10027, message=ALGO_HINT)
         pos = mt5.positions_get(ticket=int(ticket))
         if not pos:
-            return OrderResult(False, message="pozisyon bulunamadı (zaten kapanmış olabilir)")
+            return OrderResult(False, message="Pozisyon bulunamadı (kapanmış olabilir).")
         p = pos[0]
         info = mt5.symbol_info(p.symbol)
         tick = mt5.symbol_info_tick(p.symbol)
         if info is None or tick is None:
-            return OrderResult(False, retcode=10021, message=f"{p.symbol} için sembol/fiyat bilgisi yok")
+            return OrderResult(False, retcode=10021, message=f"{p.symbol} için fiyat yok (piyasa kapalı olabilir).")
+        is_buy = p.type == mt5.POSITION_TYPE_BUY
         digits = int(info.digits)
         point = info.point or 10 ** (-digits)
-        is_buy = p.type == mt5.POSITION_TYPE_BUY
-        ref = tick.bid if is_buy else tick.ask
-        min_dist = max(info.trade_stops_level, info.trade_freeze_level) * point + (tick.ask - tick.bid) + 2 * point
-        new_sl = round(float(sl), digits) if sl else 0.0
-        new_tp = round(float(tp), digits) if tp else float(p.tp or 0.0)
-        if new_sl and ((is_buy and ref - new_sl < min_dist) or ((not is_buy) and new_sl - ref < min_dist)):
-            return OrderResult(False, retcode=10016, message=f"SL güncel fiyata çok yakın (min {min_dist / point:.0f} puan); sonra tekrar denenecek")
-        req = {"action": mt5.TRADE_ACTION_SLTP, "position": int(p.ticket), "symbol": p.symbol,
-               "sl": new_sl, "tp": new_tp, "magic": self.magic}
+        ref = tick.bid if is_buy else tick.ask  # pozisyonun kapanış fiyatı
+        min_dist = max(info.trade_stops_level, info.trade_freeze_level) * point
+        new_sl = p.sl if sl is None else round(float(sl), digits)
+        new_tp = p.tp if tp is None else round(float(tp), digits)
+        side_tr = "ALIŞ" if is_buy else "SATIŞ"
+        if new_sl:
+            if (is_buy and new_sl >= ref) or ((not is_buy) and new_sl <= ref):
+                extra = " Fiyat henüz girişin ötesine geçmedi; SL girişe çekilemez." if abs(new_sl - p.price_open) < point * 2 else ""
+                return OrderResult(False, retcode=10016, message=(
+                    f"SL {new_sl} geçersiz: {side_tr} pozisyonunda SL güncel fiyatın ({ref:.{digits}f}) "
+                    f"{'altında' if is_buy else 'üstünde'} olmalı.{extra}"))
+            if abs(ref - new_sl) < min_dist:
+                return OrderResult(False, retcode=10016, message=(
+                    f"SL fiyata çok yakın: broker en az {min_dist / point:.0f} puan mesafe istiyor (güncel {ref:.{digits}f})."))
+        if new_tp:
+            if (is_buy and new_tp <= ref) or ((not is_buy) and new_tp >= ref):
+                return OrderResult(False, retcode=10016, message=(
+                    f"TP {new_tp} geçersiz: {side_tr} pozisyonunda TP güncel fiyatın ({ref:.{digits}f}) "
+                    f"{'üstünde' if is_buy else 'altında'} olmalı."))
+            if abs(new_tp - ref) < min_dist:
+                return OrderResult(False, retcode=10016, message=f"TP fiyata çok yakın: en az {min_dist / point:.0f} puan gerekli.")
+        if abs((new_sl or 0) - (p.sl or 0)) < point / 2 and abs((new_tp or 0) - (p.tp or 0)) < point / 2:
+            return OrderResult(True, p.ticket, ref, 10025, f"Değişiklik yok (SL {p.sl} TP {p.tp})")
+        req = {"action": mt5.TRADE_ACTION_SLTP, "position": p.ticket, "symbol": p.symbol,
+               "sl": float(new_sl or 0.0), "tp": float(new_tp or 0.0), "magic": p.magic}
         res = mt5.order_send(req)
         if res is None:
             return OrderResult(False, message=f"order_send None: {mt5.last_error()}")
-        if res.retcode in (10009, 10008, 10010, 10025):   # 10025 = değişiklik yok
-            return OrderResult(True, p.ticket, ref, res.retcode, f"SL {new_sl} TP {new_tp}")
+        if res.retcode in (10009, 10008, 10025):
+            return OrderResult(True, p.ticket, ref, res.retcode, f"SL {new_sl or 'yok'} · TP {new_tp or 'yok'}")
         return OrderResult(False, retcode=res.retcode, message=describe_retcode(res.retcode, res.comment))
+
+    @_locked
+    def close_partial(self, ticket: int, fraction: float = 0.5) -> OrderResult:
+        """Pozisyonun bir kısmını kapatır (fraction 0.5 = yarısı). Lot adımına aşağı yuvarlar; kalan en az minimum lot olmalı."""
+        fraction = min(0.9, max(0.1, float(fraction)))
+        if self.simulate:
+            for p in self._sim_positions:
+                if p.ticket == int(ticket):
+                    part = math.floor(p.volume * fraction / 0.01 + 1e-9) * 0.01
+                    if part < 0.01 or p.volume - part < 0.01 - 1e-9:
+                        return OrderResult(False, retcode=10014, message=f"{p.volume} lot bölünemeyecek kadar küçük (min 0.01)")
+                    self._sim_balance += p.pnl * part / p.volume
+                    p.volume = round(p.volume - part, 2)
+                    self._sim_partial.add(p.ticket)
+                    return OrderResult(True, p.ticket, p.currentPrice, 10009, f"{part:.2f} lot kapatıldı (kalan {p.volume:.2f})")
+            return OrderResult(False, message="pozisyon yok")
+        ti = mt5.terminal_info()
+        if ti is not None and not ti.trade_allowed:
+            return OrderResult(False, retcode=10027, message=ALGO_HINT)
+        pos = mt5.positions_get(ticket=int(ticket))
+        if not pos:
+            return OrderResult(False, message="Pozisyon bulunamadı (kapanmış olabilir).")
+        p = pos[0]
+        info = mt5.symbol_info(p.symbol)
+        step = (info.volume_step if info else 0.01) or 0.01
+        vmin = (info.volume_min if info else 0.01) or 0.01
+        part = math.floor(p.volume * fraction / step + 1e-9) * step
+        part = round(part, max(0, int(round(-math.log10(step)))) if step < 1 else 0)
+        if part < vmin - 1e-9 or p.volume - part < vmin - 1e-9:
+            return OrderResult(False, retcode=10014, message=f"{p.volume} lot bölünemeyecek kadar küçük (minimum lot {vmin}).")
+        is_buy = p.type == mt5.POSITION_TYPE_BUY
+        fm = info.filling_mode if info is not None else 0
+        fills = ([mt5.ORDER_FILLING_IOC] if fm & 2 else []) + ([mt5.ORDER_FILLING_FOK] if fm & 1 else []) + [mt5.ORDER_FILLING_RETURN]
+        last = OrderResult(False, message="Kısmi kapatma gönderilemedi")
+        for fill in fills:
+            tick = mt5.symbol_info_tick(p.symbol)
+            if tick is None:
+                return OrderResult(False, retcode=10021, message=f"{p.symbol} için fiyat yok")
+            req = {
+                "action": mt5.TRADE_ACTION_DEAL, "symbol": p.symbol, "volume": float(part), "position": p.ticket,
+                "type": mt5.ORDER_TYPE_SELL if is_buy else mt5.ORDER_TYPE_BUY,
+                "price": tick.bid if is_buy else tick.ask, "deviation": max(self.deviation, 30), "magic": p.magic,
+                "comment": "JARVIS yari kar", "type_time": mt5.ORDER_TIME_GTC, "type_filling": fill,
+            }
+            res = mt5.order_send(req)
+            if res is not None and res.retcode in (10009, 10008, 10010):
+                return OrderResult(True, p.ticket, res.price, res.retcode, f"{part} lot kapatıldı (kalan {round(p.volume - part, 2)})")
+            if res is not None and res.retcode != 10030:
+                return OrderResult(False, retcode=res.retcode, message=describe_retcode(res.retcode, res.comment))
+            last = OrderResult(False, retcode=getattr(res, "retcode", None), message="Doldurma modu reddedildi")
+        return last
+
+    @_locked
+    def partial_done(self, ticket: int) -> bool:
+        """Bu pozisyonda daha önce kısmi kapanış yapılmış mı? (MT5 geçmişinde çıkış işlemi var mı) — yeniden başlatmaya dayanıklı."""
+        if self.simulate or mt5 is None:
+            return int(ticket) in self._sim_partial
+        deals = mt5.history_deals_get(position=int(ticket)) or []
+        outs = {mt5.DEAL_ENTRY_OUT, getattr(mt5, "DEAL_ENTRY_OUT_BY", -1)}
+        return any(d.entry in outs for d in deals)
 
     @_locked
     def close_position(self, ticket: int) -> OrderResult:

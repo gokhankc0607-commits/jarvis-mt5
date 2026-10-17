@@ -47,8 +47,11 @@ export const BOOTSTRAP_SQL: string[] = [
 	"enabled" boolean DEFAULT true NOT NULL,
 	"timeframes" text DEFAULT 'M15,H1' NOT NULL,
 	"scan_all" boolean DEFAULT true NOT NULL,
+	"scan_mode" text DEFAULT 'list' NOT NULL,
+	"symbols" jsonb DEFAULT '[]'::jsonb NOT NULL,
 	"lot" double precision DEFAULT 0.1 NOT NULL,
 	"params" jsonb DEFAULT '{}'::jsonb NOT NULL,
+	"auto" jsonb DEFAULT '{}'::jsonb NOT NULL,
 	"updated_at" timestamp DEFAULT now() NOT NULL
 )`,
   `CREATE TABLE IF NOT EXISTS "messages" (
@@ -95,6 +98,35 @@ export const BOOTSTRAP_SQL: string[] = [
 	"created_at" timestamp DEFAULT now() NOT NULL,
 	"updated_at" timestamp DEFAULT now() NOT NULL
 )`,
+  `CREATE TABLE IF NOT EXISTS "telegram_settings" (
+	"user_id" integer PRIMARY KEY NOT NULL,
+	"enabled" boolean DEFAULT false NOT NULL,
+	"bot_token" text DEFAULT '' NOT NULL,
+	"chat_id" text DEFAULT '' NOT NULL,
+	"on_signal" boolean DEFAULT true NOT NULL,
+	"on_auto" boolean DEFAULT true NOT NULL,
+	"on_profit" boolean DEFAULT true NOT NULL,
+	"on_error" boolean DEFAULT true NOT NULL,
+	"min_conf" integer DEFAULT 70 NOT NULL,
+	"quiet_until" timestamp,
+	"buttons" boolean DEFAULT true NOT NULL,
+	"created_at" timestamp DEFAULT now() NOT NULL,
+	"updated_at" timestamp DEFAULT now() NOT NULL
+)`,
+  `CREATE TABLE IF NOT EXISTS "trade_commands" (
+	"id" serial PRIMARY KEY NOT NULL,
+	"user_id" integer NOT NULL,
+	"ticket" text NOT NULL,
+	"symbol" text NOT NULL,
+	"type" text NOT NULL,
+	"fraction" double precision,
+	"sl" double precision,
+	"tp" double precision,
+	"status" text DEFAULT 'queued' NOT NULL,
+	"note" text DEFAULT '' NOT NULL,
+	"created_at" timestamp DEFAULT now() NOT NULL,
+	"done_at" timestamp
+)`,
   `CREATE TABLE IF NOT EXISTS "trades" (
 	"id" serial PRIMARY KEY NOT NULL,
 	"user_id" integer NOT NULL,
@@ -109,6 +141,7 @@ export const BOOTSTRAP_SQL: string[] = [
 	"pnl" double precision DEFAULT 0 NOT NULL,
 	"status" text DEFAULT 'open' NOT NULL,
 	"source" text DEFAULT 'demo' NOT NULL,
+	"timeframe" text DEFAULT '' NOT NULL,
 	"comment" text DEFAULT '' NOT NULL,
 	"opened_at" timestamp DEFAULT now() NOT NULL,
 	"closed_at" timestamp
@@ -147,6 +180,39 @@ export const BOOTSTRAP_SQL: string[] = [
  * CREATE TABLE IF NOT EXISTS mevcut tabloları değiştirmediği için yeni sütunlar burada eklenir.
  */
 export const MIGRATION_SQL: string[] = [
+  `CREATE TABLE IF NOT EXISTS "telegram_settings" (
+	"user_id" integer PRIMARY KEY NOT NULL,
+	"enabled" boolean DEFAULT false NOT NULL,
+	"bot_token" text DEFAULT '' NOT NULL,
+	"chat_id" text DEFAULT '' NOT NULL,
+	"on_signal" boolean DEFAULT true NOT NULL,
+	"on_auto" boolean DEFAULT true NOT NULL,
+	"on_profit" boolean DEFAULT true NOT NULL,
+	"on_error" boolean DEFAULT true NOT NULL,
+	"min_conf" integer DEFAULT 70 NOT NULL,
+	"quiet_until" timestamp,
+	"buttons" boolean DEFAULT true NOT NULL,
+	"created_at" timestamp DEFAULT now() NOT NULL,
+	"updated_at" timestamp DEFAULT now() NOT NULL
+)`,
+  `ALTER TABLE "trades" ADD COLUMN IF NOT EXISTS "timeframe" text DEFAULT '' NOT NULL`,
+  `ALTER TABLE "kanal_settings" ADD COLUMN IF NOT EXISTS "scan_mode" text DEFAULT 'list' NOT NULL`,
+  `ALTER TABLE "kanal_settings" ADD COLUMN IF NOT EXISTS "symbols" jsonb DEFAULT '[]'::jsonb NOT NULL`,
+  `ALTER TABLE "trade_commands" ADD COLUMN IF NOT EXISTS "fraction" double precision`,
+  `ALTER TABLE "kanal_settings" ADD COLUMN IF NOT EXISTS "auto" jsonb DEFAULT '{}'::jsonb NOT NULL`,
+  `CREATE TABLE IF NOT EXISTS "trade_commands" (
+	"id" serial PRIMARY KEY NOT NULL,
+	"user_id" integer NOT NULL,
+	"ticket" text NOT NULL,
+	"symbol" text NOT NULL,
+	"type" text NOT NULL,
+	"sl" double precision,
+	"tp" double precision,
+	"status" text DEFAULT 'queued' NOT NULL,
+	"note" text DEFAULT '' NOT NULL,
+	"created_at" timestamp DEFAULT now() NOT NULL,
+	"done_at" timestamp
+)`,
   `ALTER TABLE "signals" ADD COLUMN IF NOT EXISTS "source" text DEFAULT 'agent' NOT NULL`,
   // Eski sürümlerde tohumlanan/test ile üretilen örnek sinyalleri "demo" olarak işaretle (gerçek MT5'e gitmesin)
   `UPDATE "signals" SET "source" = 'demo' WHERE "source" = 'agent' AND "reason" IN ('RSI 24.8 aşırı satımdan dönüş + CCI -168 + boğa uyumsuzluğu', 'RSI 73.1 aşırı alım + CCI 142 + ayı uyumsuzluğu', 'RSI 29.4 + CCI -104', 'RSI 27.9 aşırı satım + CCI -131 + boğa uyumsuzluğu', 'RSI 76.2 aşırı alım + CCI 188', 'RSI 78.4 + ayı uyumsuzluğu + CCI 201')`,

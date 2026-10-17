@@ -2,10 +2,8 @@
 # PyInstaller spec — JARVIS yerel ajan
 # Derleme:  pyinstaller --noconfirm jarvis.spec   ->  dist\JARVIS\JARVIS.exe
 from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_dynamic_libs, collect_submodules
-
 import os
 
-# İkon isteğe bağlıdır: yoksa derleme kırılmasın (PyInstaller eksik datas/icon dosyasında hata verir)
 ICON = "jarvis.ico" if os.path.exists("jarvis.ico") else None
 datas = [("config.example.json", ".")] + ([("jarvis.ico", ".")] if ICON else [])
 binaries = []

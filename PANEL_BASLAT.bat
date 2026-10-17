@@ -18,7 +18,7 @@ if not "%BUILT%"=="%WANT%" (
   exit /b
 )
 if not exist .env.local (
-  >.env.local echo DATABASE_URL=pglite:./data/jarvis.db.tgz
+  >.env.local echo DATABASE_URL=pglite:shared
 )
 
 REM ---------- Erisim kapsami ----------
@@ -54,6 +54,9 @@ if "%JARVIS_LAN%"=="1" (
 ) else (
   echo     ERISIM: yalnizca bu bilgisayar. Telefon/QR icin:  PANEL_BASLAT.bat lan
 )
+echo.
+echo     GUNCELLEME: Yeni RAR/ZIP indirdiginizde PANEL_GUNCELLE.bat calistirin
+echo                 ^(veya RAR/ZIP dosyasini PANEL_GUNCELLE.bat uzerine surukleyin^)
 echo.
 echo     JARVIS.exe kurulum sihirbazinda Panel URL:
 echo        http://localhost:3000

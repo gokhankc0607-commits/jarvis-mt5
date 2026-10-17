@@ -14,12 +14,12 @@ export function contractSize(symbol: string) {
 export function pipSize(symbol: string) {
   const u = symbol.toUpperCase();
   if (u.includes("JPY")) return 0.01;
-  if (u.startsWith("XAU")) return 0.1;
-  if (u.startsWith("XAG") || /^(USOIL|UKOIL|WTI|BRENT|XTI|XBR)/.test(u)) return 0.01;
+  if (u.startsWith("XAU") || u.startsWith("GOLD")) return 0.1;
+  if (u.startsWith("XAG") || u.startsWith("SILVER") || /^(USOIL|UKOIL|WTI|BRENT|XTI|XBR)/.test(u)) return 0.01;
   if (u.startsWith("BTC")) return 1;
   if (u.startsWith("ETH")) return 0.1;
   if (/^(LTC|XRP|SOL|DOGE|ADA|BNB|DOT|AVAX)/.test(u)) return 0.01;
-  if (/^(US30|US100|US500|USTEC|NAS|SPX|GER|DE40|DE30|DAX|UK100|JP225|FRA40|EU50|NDX)/.test(u)) return 1;
+  if (/^(US30|US100|US500|USTEC|NAS|NDX|SPX|SP500|DJ|DOW|WS30|GER|DE40|DE30|DAX|UK100|FTSE|JP225|JPN225|NIK|FRA40|EU50|AUS200|HK50)/.test(u)) return 1;
   return 0.0001;
 }
 

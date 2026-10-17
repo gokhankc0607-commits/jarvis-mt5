@@ -1,3 +1,4 @@
+import { sameSymbol } from "./symbols";
 import type { Candle } from "./indicators";
 
 /**
@@ -67,7 +68,7 @@ export function getScan(userId: number, maxAgeMs = 90000) {
 
 /* ------------------------------------------------------------------ canlı fiyat akışı (ajan -> panel, ~1 sn) */
 export type Tick = {
-  s: string; bid: number; ask: number; t: number; stale: number;
+  s: string; real?: string; bid: number; ask: number; t: number; stale: number;
   digits?: number; point?: number; stops?: number; minLot?: number; lotStep?: number; at: number;
 };
 const gt = globalThis as typeof globalThis & {
@@ -86,6 +87,11 @@ export function getTick(userId: number, symbol: string, maxAgeMs = 15000): Tick 
   const t = gt.__jarvisTicks?.get(userId)?.get(symbol.toUpperCase());
   return t && Date.now() - t.at < maxAgeMs ? t : undefined;
 }
+/** Takma ad / ek farkıyla da bulur (US100 <-> NAS100, EURUSD <-> EURUSD.m). */
+export function findTick(userId: number, symbol: string, maxAgeMs = 20000): Tick | undefined {
+  return getTick(userId, symbol, maxAgeMs) ?? allTicks(userId, maxAgeMs).find((t) => sameSymbol(t.s, symbol) || (t.real ? sameSymbol(t.real, symbol) : false));
+}
+
 export function allTicks(userId: number, maxAgeMs = 15000): Tick[] {
   const m = gt.__jarvisTicks?.get(userId);
   if (!m) return [];
@@ -105,4 +111,14 @@ export function setAgentInfo(userId: number, p: Partial<AgentInfo>) {
 }
 export function getAgentInfo(userId: number): AgentInfo | undefined {
   return gt.__jarvisAgent?.get(userId);
+}
+
+/** MT5 Piyasa Gözlemi'ndeki semboller (ajan bildirir; takip listesi seçimi için). */
+const gm = globalThis as typeof globalThis & { __jarvisMW?: Map<number, { at: number; list: string[] }> };
+export function setMarketWatch(userId: number, list: string[]) {
+  gm.__jarvisMW ??= new Map();
+  gm.__jarvisMW.set(userId, { at: Date.now(), list });
+}
+export function getMarketWatch(userId: number): string[] {
+  return gm.__jarvisMW?.get(userId)?.list ?? [];
 }

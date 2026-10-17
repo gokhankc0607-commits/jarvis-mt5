@@ -96,9 +96,8 @@ export default async function AgentPage() {
         <h3 className="text-[11px] font-bold uppercase tracking-[0.25em] text-violet-300" style={{ fontFamily: "Orbitron" }}>Güncelleme · baştan kurmaya gerek yok</h3>
         <div className="mt-3 grid gap-3 md:grid-cols-3 text-sm text-slate-300">
           <div className="rounded-xl border border-cyan-400/15 bg-black/30 p-4">
-            <div className="mb-1 font-bold text-cyan-200">1 · Panel</div>
-            Yeni dosyaları eski klasörün <b>üzerine</b> çıkartın (Tümünü değiştir). Verileriniz (<code>data\</code>) ve ayarlarınız (<code>.env.local</code>) projede olmadığı için <b>silinmez</b>.
-            Sonra <b>PANEL_BASLAT.bat</b> — sürüm değiştiyse kendisi yeniden derler.
+            <div className="mb-1 font-bold text-cyan-200">1 · Panel (RAR / ZIP&apos;ten Otomatik)</div>
+            İndirdiğiniz <code>.rar</code> veya <code>.zip</code> dosyasını <b>PANEL_GUNCELLE.bat</b> üzerine sürükleyin ya da <b>PANEL_GUNCELLE.bat</b>&apos;a çift tıklayın — arşivi doğrudan mevcut klasöre çekip derler. Verileriniz (<code>%APPDATA%\JARVIS</code>) ve ayarlarınız korunur.
           </div>
           <div className="rounded-xl border border-emerald-400/20 bg-black/30 p-4">
             <div className="mb-1 font-bold text-emerald-200">2 · Ajan (önerilen)</div>

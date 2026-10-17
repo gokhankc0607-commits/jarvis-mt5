@@ -1,5 +1,5 @@
 import { userFromAgentKey } from "@/lib/auth";
-import { putScan, putSeries, setAgentInfo, setPing } from "@/lib/live";
+import { putScan, putSeries, setAgentInfo, setMarketWatch, setPing } from "@/lib/live";
 import { TF_MIN } from "@/lib/tf";
 import type { Candle } from "@/lib/indicators";
 
@@ -19,6 +19,7 @@ export async function POST(req: Request) {
     n++;
   }
   if (typeof b.ping === "number") setPing(u.id, b.ping);
+  if (Array.isArray(b.mw)) setMarketWatch(u.id, (b.mw as unknown[]).filter((x): x is string => typeof x === "string").slice(0, 500));
   if (b.feed && typeof b.feed === "object") {
     const errs = Array.isArray(b.feed.errors) ? (b.feed.errors as unknown[]).slice(0, 20).map((e) => (Array.isArray(e) ? [String(e[0]), String(e[1]).slice(0, 160)] : [String(e), ""])) : [];
     setAgentInfo(u.id, { feedErrors: errs as [string, string][], feedOk: Number(b.feed.ok ?? 0) || 0 });
